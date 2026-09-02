@@ -102,16 +102,24 @@ public final class StoreKitManager: @unchecked Sendable {
     // MARK: - Active Transactions
 
     public func getActiveTransactions() async -> [StoreKit.Transaction] {
-        var transactions: [StoreKit.Transaction] = []
+        await getActiveEntitlements().map { $0.transaction }
+    }
+
+    /// Active entitlements paired with their JWS representation.
+    ///
+    /// `restore()` needs the signed payload as `receipt_data` and `StoreKit.Transaction`
+    /// alone does not carry it — only the enclosing `VerificationResult` does.
+    public func getActiveEntitlements() async -> [PurchaseOutcome] {
+        var entitlements: [PurchaseOutcome] = []
         for await result in StoreKit.Transaction.currentEntitlements {
             switch result {
             case .verified(let transaction):
-                transactions.append(transaction)
+                entitlements.append((transaction, result.jwsRepresentation))
             case .unverified:
                 break
             }
         }
-        return transactions
+        return entitlements
     }
 
     // MARK: - Transaction Listener

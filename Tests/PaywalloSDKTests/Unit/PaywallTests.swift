@@ -115,7 +115,54 @@ final class PaywallMessageParserTests: XCTestCase {
     func testMessageId_withTimestamp_usesTypeTimestamp() {
         let json = #"{"type":"ready","payload":{"timestamp":1000.0}}"#
         let msg = PaywallMessageParser.parse(json)!
-        XCTAssertEqual(msg.messageId, "ready:1000.0")
+        XCTAssertEqual(msg.messageId, "ready:1000")
+    }
+
+    func testMessageId_epochTimestamp_hasNoDecimalPoint() {
+        // O RN interpola o número JS sem casa decimal; um "1735689600000.0" aqui daria
+        // chave de dedup diferente da do RN para a MESMA mensagem.
+        let json = #"{"type":"ready","payload":{"timestamp":1735689600000}}"#
+        let msg = PaywallMessageParser.parse(json)!
+        XCTAssertEqual(msg.messageId, "ready:1735689600000")
+    }
+
+    func testMessageId_fractionalTimestamp_keepsFraction() {
+        let json = #"{"type":"ready","payload":{"timestamp":1000.5}}"#
+        let msg = PaywallMessageParser.parse(json)!
+        XCTAssertEqual(msg.messageId, "ready:1000.5")
+    }
+
+    // MARK: - haptic style
+
+    func testParse_hapticStyleMedium_isPreserved() {
+        let json = #"{"type":"haptic","payload":{"style":"medium"}}"#
+        XCTAssertEqual(PaywallMessageParser.parse(json)?.style, "medium")
+    }
+
+    func testParse_hapticStyleHeavy_isPreserved() {
+        let json = #"{"type":"haptic","payload":{"style":"heavy"}}"#
+        XCTAssertEqual(PaywallMessageParser.parse(json)?.style, "heavy")
+    }
+
+    func testParse_hapticStyleInvalid_fallsBackToLight() {
+        // O webview pediu vibração: um valor novo/errado não pode virar silêncio.
+        let json = #"{"type":"haptic","payload":{"style":"nuclear"}}"#
+        XCTAssertEqual(PaywallMessageParser.parse(json)?.style, "light")
+    }
+
+    func testParse_hapticStyleNull_fallsBackToLight() {
+        let json = #"{"type":"haptic","payload":{"style":null}}"#
+        XCTAssertEqual(PaywallMessageParser.parse(json)?.style, "light")
+    }
+
+    func testParse_hapticWithoutStyle_isNil() {
+        let json = #"{"type":"haptic","payload":{}}"#
+        XCTAssertNil(PaywallMessageParser.parse(json)?.style)
+    }
+
+    func testParse_noPayload_styleIsNil() {
+        let json = #"{"type":"close"}"#
+        XCTAssertNil(PaywallMessageParser.parse(json)?.style)
     }
 
     func testMessageId_noPayload_usesTypeColon() {
@@ -289,6 +336,185 @@ final class PaywallVariableResolverTests: XCTestCase {
         let result = PaywallVariableResolver.resolve("Hello World!", context: context)
         XCTAssertEqual(result, "Hello World!")
     }
+
+    // MARK: - device / user namespaces têm chaves fixas
+
+    func testResolve_deviceUnknownKeyPresentInDict_stillEmpty() {
+        // O namespace é contrato com o editor do painel, não um dump do dicionário.
+        let context = PaywallVariableResolver.Context(deviceInfo: ["secretToken": "abc"])
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{device.secretToken}}", context: context), "")
+    }
+
+    func testResolve_deviceFixedKeys() {
+        let context = PaywallVariableResolver.Context(
+            deviceInfo: ["name": "iPhone do Lucas", "model": "iPhone15,2", "os": "iOS",
+                         "osVersion": "17.4", "locale": "pt-BR"]
+        )
+        let tmpl = "{{device.name}}|{{device.model}}|{{device.os}}|{{device.osVersion}}|{{device.locale}}"
+        XCTAssertEqual(
+            PaywallVariableResolver.resolve(tmpl, context: context),
+            "iPhone do Lucas|iPhone15,2|iOS|17.4|pt-BR"
+        )
+    }
+
+    func testResolve_userFixedKeys() {
+        let context = PaywallVariableResolver.Context(
+            userInfo: ["id": "u_1", "name": "Lucas", "email": "l@x.com", "cpf": "000"]
+        )
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{user.id}}", context: context), "u_1")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{user.email}}", context: context), "l@x.com")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{user.cpf}}", context: context), "")
+    }
+
+    // MARK: - customVariables (último fallback antes de "")
+
+    func testResolve_customVariable_isUsedAsFinalFallback() {
+        let context = PaywallVariableResolver.Context(customVariables: ["cupom": "BLACK50"])
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{cupom}}", context: context), "BLACK50")
+    }
+
+    func testResolve_customVariableAbsent_emptyString() {
+        let context = PaywallVariableResolver.Context(customVariables: ["cupom": "BLACK50"])
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{outro}}", context: context), "")
+    }
+
+    func testResolve_knownNamespaceNeverFallsBackToCustom() {
+        let context = PaywallVariableResolver.Context(customVariables: ["device.model": "hack"])
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{device.model}}", context: context), "")
+    }
+
+    // MARK: - Variáveis legadas sem namespace
+
+    func testResolve_legacyDeviceName() {
+        let context = PaywallVariableResolver.Context(deviceInfo: ["name": "iPhone do Lucas"])
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{device_name}}", context: context), "iPhone do Lucas")
+    }
+
+    func testResolve_legacyProductPrice_usesLocalizedPrice() {
+        let product = makeFullProduct(price: "9.99", localizedPrice: "R$ 9,99")
+        let context = PaywallVariableResolver.Context(selectedProduct: product)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{product_price}}", context: context), "R$ 9,99")
+    }
+
+    func testResolve_legacyTrialPeriod() {
+        let product = makeFullProduct(freeTrialPeriod: "P7D")
+        let context = PaywallVariableResolver.Context(selectedProduct: product)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{trial_period}}", context: context), "P7D")
+    }
+
+    func testResolve_legacyProductPrice_noSelected_fallsBackToCustom() {
+        let context = PaywallVariableResolver.Context(customVariables: ["product_price": "grátis"])
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{product_price}}", context: context), "grátis")
+    }
+
+    // MARK: - products.tertiary
+
+    func testResolve_productsTertiary() {
+        let product = makeFullProduct(productId: "com.app.lifetime", title: "Lifetime")
+        let context = PaywallVariableResolver.Context(tertiaryProduct: product)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.tertiary.name}}", context: context), "Lifetime")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.tertiary.id}}", context: context), "com.app.lifetime")
+    }
+
+    // MARK: - products.hasIntroductoryOffer
+
+    func testResolve_hasIntroductoryOffer_trueWhenAnyProductHasIt() {
+        let plain = makeFullProduct(productId: "a")
+        let intro = makeFullProduct(productId: "b", introductoryPrice: "R$ 1,99")
+        let context = PaywallVariableResolver.Context(primaryProduct: plain, secondaryProduct: intro)
+        XCTAssertEqual(
+            PaywallVariableResolver.resolve("{{products.hasIntroductoryOffer}}", context: context),
+            "true"
+        )
+    }
+
+    func testResolve_hasIntroductoryOffer_falseWhenNoneHasIt() {
+        let context = PaywallVariableResolver.Context(primaryProduct: makeFullProduct())
+        XCTAssertEqual(
+            PaywallVariableResolver.resolve("{{products.hasIntroductoryOffer}}", context: context),
+            "false"
+        )
+    }
+
+    func testResolve_hasIntroductoryOffer_falseWithNoProducts() {
+        XCTAssertEqual(
+            PaywallVariableResolver.resolve("{{products.hasIntroductoryOffer}}", context: PaywallVariableResolver.Context()),
+            "false"
+        )
+    }
+
+    // MARK: - Propriedades de produto
+
+    func testResolve_price_usesLocalizedPriceNotRawPrice() {
+        // `price` cru é "9.99" — sem símbolo nem moeda; era isso que ia pra tela.
+        let product = makeFullProduct(price: "9.99", localizedPrice: "R$ 9,99")
+        let context = PaywallVariableResolver.Context(selectedProduct: product)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.price}}", context: context), "R$ 9,99")
+    }
+
+    func testResolve_pricePerMonth_fallsBackToLocalizedPrice() {
+        let product = makeFullProduct(localizedPrice: "R$ 99,00", pricePerMonth: nil)
+        let context = PaywallVariableResolver.Context(selectedProduct: product)
+        XCTAssertEqual(
+            PaywallVariableResolver.resolve("{{products.selected.pricePerMonth}}", context: context),
+            "R$ 99,00"
+        )
+    }
+
+    func testResolve_periodAndRenewalPeriod() {
+        let product = makeFullProduct(subscriptionPeriod: "P1M")
+        let context = PaywallVariableResolver.Context(selectedProduct: product)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.period}}", context: context), "P1M")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.renewalPeriod}}", context: context), "P1M")
+    }
+
+    func testResolve_trialPeriodAndIntroPrice() {
+        let product = makeFullProduct(introductoryPrice: "R$ 1,99", freeTrialPeriod: "P3D")
+        let context = PaywallVariableResolver.Context(selectedProduct: product)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.trialPeriod}}", context: context), "P3D")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.introPrice}}", context: context), "R$ 1,99")
+    }
+
+    func testResolve_hasFreeTrialAndHasIntroOffer() {
+        let withOffers = makeFullProduct(introductoryPrice: "R$ 1,99", freeTrialPeriod: "P3D")
+        let without = makeFullProduct()
+        let ctxWith = PaywallVariableResolver.Context(selectedProduct: withOffers)
+        let ctxWithout = PaywallVariableResolver.Context(selectedProduct: without)
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.hasFreeTrial}}", context: ctxWith), "true")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.hasIntroOffer}}", context: ctxWith), "true")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.hasFreeTrial}}", context: ctxWithout), "false")
+        XCTAssertEqual(PaywallVariableResolver.resolve("{{products.selected.hasIntroOffer}}", context: ctxWithout), "false")
+    }
+
+    // MARK: - Helper com todos os campos opcionais
+
+    private func makeFullProduct(
+        productId: String = "com.app.pro",
+        title: String = "Pro",
+        price: String = "9.99",
+        localizedPrice: String = "$9.99",
+        subscriptionPeriod: String? = nil,
+        introductoryPrice: String? = nil,
+        freeTrialPeriod: String? = nil,
+        pricePerMonth: String? = nil
+    ) -> Product {
+        Product(
+            productId: productId,
+            title: title,
+            description: "Full access",
+            price: price,
+            priceValue: 9.99,
+            currency: "BRL",
+            localizedPrice: localizedPrice,
+            type: .subscription,
+            subscriptionPeriod: subscriptionPeriod,
+            introductoryPrice: introductoryPrice,
+            introductoryPriceValue: nil,
+            freeTrialPeriod: freeTrialPeriod,
+            trialDays: nil,
+            pricePerMonth: pricePerMonth
+        )
+    }
 }
 
 // MARK: - PaywallCloseReason Tests
@@ -331,14 +557,14 @@ final class PaywallCloseReasonTests: XCTestCase {
         XCTAssertEqual(PaywallCloseReason.canonicalize("error"), "error")
     }
 
-    // MARK: - Unknown → default dismiss
+    // MARK: - Unknown → passa cru (não pode mascarar valor novo)
 
-    func testCanonicalize_unknown_returnsDismiss() {
-        XCTAssertEqual(PaywallCloseReason.canonicalize("whatever"), "dismiss")
+    func testCanonicalize_unknown_returnsInput() {
+        XCTAssertEqual(PaywallCloseReason.canonicalize("whatever"), "whatever")
     }
 
-    func testCanonicalize_empty_returnsDismiss() {
-        XCTAssertEqual(PaywallCloseReason.canonicalize(""), "dismiss")
+    func testCanonicalize_empty_returnsInput() {
+        XCTAssertEqual(PaywallCloseReason.canonicalize(""), "")
     }
 
     // MARK: - isCanonical

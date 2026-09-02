@@ -33,3 +33,13 @@ public struct ConditionalFlagContext: Codable, Sendable {
         self.distinctId = distinctId
     }
 }
+
+/// Server-side kill switches for the attribution subsystem, served by `GET /sdk/flags`.
+public struct AttributionFlags: Codable, Sendable {
+    /// Turns the iCloud-Keychain reinstall/restore signal on or off without an app release.
+    public let syncedIdentityEnabled: Bool
+
+    public init(syncedIdentityEnabled: Bool) {
+        self.syncedIdentityEnabled = syncedIdentityEnabled
+    }
+}

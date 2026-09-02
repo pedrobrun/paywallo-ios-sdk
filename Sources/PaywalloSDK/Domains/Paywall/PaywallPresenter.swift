@@ -47,6 +47,7 @@ public final class PaywallPresenter: UIViewController {
     private let products: [Product]
     private let primaryProductId: String?
     private let secondaryProductId: String?
+    private let tertiaryProductId: String?
 
     // MARK: - Variant / Campaign Context
 
@@ -125,6 +126,7 @@ public final class PaywallPresenter: UIViewController {
         products: [Product],
         primaryProductId: String?,
         secondaryProductId: String?,
+        tertiaryProductId: String? = nil,
         tracking: PaywallTracking,
         heartbeat: PaywallHeartbeat,
         variantKey: String? = nil,
@@ -138,6 +140,7 @@ public final class PaywallPresenter: UIViewController {
         self.products = products
         self.primaryProductId = primaryProductId
         self.secondaryProductId = secondaryProductId
+        self.tertiaryProductId = tertiaryProductId
         self.tracking = tracking
         self.heartbeat = heartbeat
         self.variantKey = variantKey
@@ -284,9 +287,19 @@ public final class PaywallPresenter: UIViewController {
                 delegate?.paywallPresenter(self, didRequestOpenURL: url)
             }
         case "haptic":
-            Haptics.impact(.light)
+            Haptics.impact(hapticStyle(message.style))
         default:
             break
+        }
+    }
+
+    /// O webview escolhe a intensidade por `payload.style`; sem estilo, cai no default
+    /// leve. Ignorar o campo fazia todo feedback tátil sair igual.
+    private func hapticStyle(_ raw: String?) -> Haptics.Style {
+        switch raw {
+        case "medium": return .medium
+        case "heavy":  return .heavy
+        default:       return .light
         }
     }
 
@@ -308,7 +321,8 @@ public final class PaywallPresenter: UIViewController {
             craftData: craftData,
             products: products,
             primaryProductId: primaryProductId,
-            secondaryProductId: secondaryProductId
+            secondaryProductId: secondaryProductId,
+            tertiaryProductId: tertiaryProductId
         )
         paywalloWebView?.evaluateJavaScript(script)
 #endif
@@ -318,6 +332,20 @@ public final class PaywallPresenter: UIViewController {
 
     private func closePaywall(reason: String) {
         guard !isClosed else { return }
+        let canonical = emitClosed(reason: reason)
+
+        tearDown()
+        delegate?.paywallPresenterDidClose(self, closeReason: canonical)
+
+        DispatchQueue.main.async {
+            self.dismiss(animated: true)
+        }
+    }
+
+    /// Emissor único do `paywall {type: "closed"}`. Marca `isClosed` antes de emitir
+    /// para que nenhum caminho de saída emita duas vezes.
+    @discardableResult
+    private func emitClosed(reason: String) -> String {
         isClosed = true
 
         let canonical = PaywallCloseReason.canonicalize(reason)
@@ -333,13 +361,7 @@ public final class PaywallPresenter: UIViewController {
             variantId: variantId,
             campaignId: campaignId
         )
-
-        tearDown()
-        delegate?.paywallPresenterDidClose(self, closeReason: canonical)
-
-        DispatchQueue.main.async {
-            self.dismiss(animated: true)
-        }
+        return canonical
     }
 
     // MARK: - Error Fallback
@@ -364,6 +386,14 @@ public final class PaywallPresenter: UIViewController {
         if let observer = backgroundObserver {
             NotificationCenter.default.removeObserver(observer)
             backgroundObserver = nil
+        }
+
+        // O VC pode sumir sem passar por `closePaywall` — swipe-to-dismiss, o host
+        // trocando a hierarquia, deinit. Sem este emit o `closed` se perdia de vez: o
+        // recovery de crash também não pega, porque `stopHeartbeat` logo abaixo apaga
+        // o snapshot que ele usaria.
+        if !isClosed {
+            emitClosed(reason: "dismiss")
         }
 
         heartbeat.stopHeartbeat()

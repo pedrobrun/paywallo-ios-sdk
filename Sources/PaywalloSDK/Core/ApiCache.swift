@@ -4,7 +4,7 @@ import Foundation
 private struct CacheEntry<T> {
     let value: T
     let storedAt: Date
-    let ttl: TimeInterval?  // nil = permanent (e.g. 404 tombstone has ttl=0 treated separately)
+    let ttl: TimeInterval?  // set() always fills it with defaultTTL when the caller omits one
     let isNull: Bool        // true for 404/null tombstones
 
     var isExpired: Bool {
@@ -20,31 +20,49 @@ private struct CacheEntry<T> {
 /// - Stale-while-revalidate: expired entries are returned immediately while
 ///   the caller refreshes in the background.
 public final class ApiCache {
+    /// Applied when `set` is called without an explicit TTL.
+    public static let defaultTTL: TimeInterval = 300
+    /// 404 tombstone lifetime. 30s, not 60s: a paywall published mid-session used to stay
+    /// invisible for a full minute after going live.
+    public static let defaultNullTTL: TimeInterval = 30
+    /// Past its TTL an entry is still served while it revalidates — but only inside this
+    /// window (86_400_000 ms). Older than a day it is not "stale", it is wrong.
+    public static let staleWindow: TimeInterval = 86_400
+    /// Entry ceiling. On overflow only the already-expired entries are evicted: a live entry
+    /// is never thrown away to make room.
+    public static let maxSize = 200
+
     private var store: [String: Any] = [:]
     private var nullTombstones: [String: Date] = [:]
     private let nullTtl: TimeInterval
     private let lock = NSLock()
 
-    public init(nullTtl: TimeInterval = 60) {
+    public init(nullTtl: TimeInterval = ApiCache.defaultNullTTL) {
         self.nullTtl = nullTtl
     }
 
     // MARK: - Generic set/get
 
-    /// Store a value under key with a given TTL (seconds). Pass nil for no expiry.
-    public func set<T>(_ key: String, value: T, ttl: TimeInterval?) {
+    /// Store a value under key with a given TTL (seconds). Omit `ttl` for `defaultTTL`.
+    public func set<T>(_ key: String, value: T, ttl: TimeInterval? = nil) {
         lock.lock()
         defer { lock.unlock() }
         nullTombstones.removeValue(forKey: key)
-        store[key] = CacheEntry(value: value, storedAt: Date(), ttl: ttl, isNull: false)
+        store[key] = CacheEntry(value: value, storedAt: Date(), ttl: ttl ?? Self.defaultTTL, isNull: false)
+        evictExpiredEntriesUnlocked()
     }
 
-    /// Retrieve a cached value. Returns the value even if stale (stale-while-revalidate).
-    /// Use `isStale(key:)` to decide whether to revalidate in background.
+    /// Retrieve a cached value. Returns the value even when past its TTL
+    /// (stale-while-revalidate) as long as it is inside `staleWindow`; use `isStale(key:)` to
+    /// decide whether to revalidate in the background.
     public func get<T>(_ key: String) -> T? {
         lock.lock()
         defer { lock.unlock() }
         guard let entry = store[key] as? CacheEntry<T> else { return nil }
+        guard Date().timeIntervalSince(entry.storedAt) < Self.staleWindow else {
+            store.removeValue(forKey: key)
+            return nil
+        }
         return entry.value
     }
 
@@ -131,6 +149,16 @@ public final class ApiCache {
         // instead we use a protocol-based approach via a box.
         guard let entry = store[key] as? ExpiryCheckable else { return false }
         return entry.isExpired
+    }
+
+    /// Only runs past `maxSize`, and only drops entries that are already past their TTL —
+    /// evicting a live entry would turn a memory cap into a cache miss on the hot path.
+    private func evictExpiredEntriesUnlocked() {
+        guard store.count > Self.maxSize else { return }
+        store = store.filter { _, value in
+            guard let entry = value as? ExpiryCheckable else { return true }
+            return !entry.isExpired
+        }
     }
 }
 

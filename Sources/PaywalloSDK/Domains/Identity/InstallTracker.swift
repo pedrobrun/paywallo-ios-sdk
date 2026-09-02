@@ -1,248 +1,273 @@
-import CommonCrypto
 import Foundation
 
 public final class InstallTracker {
     private let storage: SecureStorage
-    private var debug = false
+    private let attributionTracker: AttributionTracker
+    private let retryScheduler: InstallRetryScheduler
+    private let debug: Bool
     private var trackingInProgress = false
 
-    public init(storage: SecureStorage = .shared) {
+    public init(
+        storage: SecureStorage = .shared,
+        debug: Bool = false,
+        attributionTracker: AttributionTracker = .shared,
+        deepLinkStore: DeferredDeepLinkStore = .shared
+    ) {
         self.storage = storage
+        self.debug = debug
+        self.attributionTracker = attributionTracker
+        self.retryScheduler = InstallRetryScheduler(
+            debug: debug,
+            storage: storage,
+            attributionTracker: attributionTracker,
+            deepLinkStore: deepLinkStore
+        )
     }
 
-    /// Track install if not already tracked. Fire-and-forget.
+    /// Returns `true` ONLY when `$app_installed` was actually dispatched.
+    ///
+    /// The caller logs on this: the old signature resolved the same way on every early
+    /// exit (already tracked, no distinctId), which sent people investigating the loss of
+    /// a critical event where none had happened.
+    @discardableResult
     public func trackIfNeeded(
-        distinctIdProvider: () -> String,
+        apiClient: ApiClient,
+        distinctIdProvider: @escaping () -> String,
         sessionId: String?,
         deviceData: DeviceData?,
         advertisingIds: AdvertisingIdResult?,
-        attribution: AttributionCapture?,
         fbAnonymousId: String?,
-        trackEvent: @escaping (String, [String: AnyCodable], EventPriority) async -> Void,
-        appKey: String? = nil
-    ) async {
-        // Check two-stage idempotency
-        let installTracked = await storage.get(PaywalloConstants.installTrackedKey)
-        if installTracked != nil {
-            return  // Already tracked successfully
-        }
-
-        guard !trackingInProgress else { return }
+        referrer: MetaDeferredLinkParams? = nil,
+        idfvChanged: Bool = false,
+        syncedIdentityEnabled: Bool = true,
+        trackEvent: @escaping (String, [String: AnyCodable], EventPriority) async -> Void
+    ) async -> Bool {
+        guard !trackingInProgress else { return false }
         trackingInProgress = true
         defer { trackingInProgress = false }
 
-        let installSent = await storage.get(PaywalloConstants.appInstalledSentKey)
-        if installSent != nil {
-            // Pre-flight was set but post-success wasn't → clear and retry
-            await storage.remove(PaywalloConstants.appInstalledSentKey)
-        }
+        return await doTrack(
+            apiClient: apiClient,
+            distinctIdProvider: distinctIdProvider,
+            sessionId: sessionId,
+            deviceData: deviceData,
+            advertisingIds: advertisingIds,
+            fbAnonymousId: fbAnonymousId,
+            referrer: referrer,
+            idfvChanged: idfvChanged,
+            syncedIdentityEnabled: syncedIdentityEnabled,
+            trackEvent: trackEvent
+        )
+    }
 
-        // Wait for distinct ID
-        var distinctId = distinctIdProvider()
-        var retries = 0
-        while distinctId.isEmpty && retries < 10 {
-            try? await Task.sleep(nanoseconds: 100_000_000)  // 100ms
-            distinctId = distinctIdProvider()
-            retries += 1
-        }
+    // swiftlint:disable:next function_body_length
+    private func doTrack(
+        apiClient: ApiClient,
+        distinctIdProvider: @escaping () -> String,
+        sessionId: String?,
+        deviceData: DeviceData?,
+        advertisingIds: AdvertisingIdResult?,
+        fbAnonymousId: String?,
+        referrer: MetaDeferredLinkParams?,
+        idfvChanged: Bool,
+        syncedIdentityEnabled: Bool,
+        trackEvent: @escaping (String, [String: AnyCodable], EventPriority) async -> Void
+    ) async -> Bool {
+        // Arms the pre-send flag BEFORE dispatching so concurrent cold-starts cannot both
+        // fire `$app_installed`. `hasResidue` alone no longer decides the outcome — the
+        // classifier below weighs it against a fresh campaign signal.
+        let hasResidue = await InstallIdempotency.checkAndArmInstallGuard(storage: storage)
 
-        guard !distinctId.isEmpty else {
-            // Don't set INSTALL_SENT — next boot will retry
-            return
-        }
+        // Read BEFORE classifyInstallAttempt, which overwrites APP_VERSION as a side
+        // effect when the version changes — after that the "previous" value is gone.
+        // Raw signals for diagnosis and retroactive reclassification, never fed back into
+        // the classification itself.
+        let hasInstallTrackedKey = await storage.get(PaywalloConstants.installTrackedKey) != nil
+        let hasLegacyInstallTrackedKey =
+            storage.nativeStorage.get(PaywalloConstants.legacyInstallTrackedKey) != nil
+        let previousAppVersion = await storage.get(PaywalloConstants.installAppVersionKey)
 
-        // Set pre-flight guard
-        await storage.set(PaywalloConstants.appInstalledSentKey, value: "1")
-
-        // Get or create stable install event ID
-        let installEventId = await getOrCreateInstallEventId(
-            idfv: advertisingIds?.idfv,
-            appKey: appKey
+        let classification = await InstallIdempotency.classifyInstallAttempt(
+            storage: storage,
+            params: ClassifyInstallAttemptParams(
+                hasResidue: hasResidue,
+                // Play Install Referrer is Android-only; on iOS the recent click/deep-link
+                // capture is the proxy signal.
+                referrerClickTimestampSeconds: nil,
+                attributionCapturedAtIso: attributionTracker.get()?.capturedAt,
+                currentAppVersion: deviceData?.appVersion
+            )
         )
 
-        // Build payload — shape matches RN SDK InstallTracker._doTrack()
-        var payload: [String: AnyCodable] = [
-            "installedAt": AnyCodable(Date().timeIntervalSince1970 * 1000),
-            "platform": AnyCodable("ios"),
-            "installEventId": AnyCodable(installEventId),
-        ]
-
-        if let sessionId = sessionId {
-            payload["sessionId"] = AnyCodable(sessionId)
+        guard shouldFireInstall(classification) else {
+            // `$app_installed` already fired on a past launch (or this is an
+            // update/relaunch with no new signal) — which says NOTHING about the
+            // deferred match having a confirmed answer. Retry that on its own, without
+            // re-lighting the install event.
+            await retryScheduler.retryIfDue(apiClient: apiClient)
+            return false
         }
 
-        // Device data
+        // Race guard: if identity init is still in flight, distinctId comes back empty.
+        // Wait for it explicitly — on timeout we do NOT mark anything, so the next boot retries.
+        guard let distinctId = await waitForDistinctId(distinctIdProvider) else {
+            if debug {
+                print("[Paywallo:Install] trackIfNeeded skipped — distinctId unavailable after retry; will retry next boot")
+            }
+            return false
+        }
+
+        let installedAt = Date().timeIntervalSince1970 * 1000
+
+        let installEventId = await InstallIdempotency.resolveInstallEventId(
+            deviceKey: advertisingIds?.idfv,
+            appKey: apiClient.appKey,
+            storage: storage
+        )
+
+        let effectiveAnonId = await resolveAnonId(fbAnonymousId)
+
+        // Telemetry only — never fed back into classification.
+        let syncSignals = await SyncedIdentitySignal.collect(
+            storage: storage,
+            enabled: syncedIdentityEnabled
+        )
+
+        // Raw signals behind the classification above, nested under ONE key (not
+        // flattened) to spend a single slot of the server's 50-key boundedProperties
+        // budget. Never reprocessed here.
+        let installSignals = buildInstallClassificationSignals(
+            hasInstallTrackedKey: hasInstallTrackedKey,
+            hasLegacyInstallTrackedKey: hasLegacyInstallTrackedKey,
+            previousAppVersion: previousAppVersion,
+            idfvChanged: idfvChanged,
+            syncedIdentityKeyExists: syncSignals.syncedIdentityKeyExists
+        )
+
+        let country = installRegionCode()
+
+        var payload: [String: AnyCodable] = [
+            "installedAt": AnyCodable(installedAt),
+            "platform": AnyCodable(PaywalloConstants.sdkPlatform),
+            "installEventId": AnyCodable(installEventId),
+            "installClassification": AnyCodable(classification.rawValue),
+            "installSignals": AnyCodable(installSignals.toPayload()),
+            "syncedIdentityKeyExists": AnyCodable(syncSignals.syncedIdentityKeyExists),
+            "syncedIdentityDivergence": AnyCodable(syncSignals.syncedIdentityDivergence),
+            // Always present: "the app never asked" and "the user said no" are different
+            // answers, and only the status tells them apart downstream.
+            "attStatus": AnyCodable((advertisingIds?.attStatus ?? .unavailable).rawValue),
+        ]
+
+        if let sessionId = sessionId { payload["sessionId"] = AnyCodable(sessionId) }
+        if let country = country { payload["country"] = AnyCodable(country) }
+
         if let device = deviceData {
-            payload["appVersion"] = AnyCodable(device.appVersion)
+            payload["deviceModel"] = AnyCodable(device.modelId.isEmpty ? device.model : device.modelId)
             payload["osVersion"] = AnyCodable(device.systemVersion)
-            payload["deviceModel"] = AnyCodable(device.modelId)
+            payload["appVersion"] = AnyCodable(device.appVersion)
             payload["buildNumber"] = AnyCodable(device.buildNumber)
             payload["screenWidth"] = AnyCodable(device.screenWidth)
             payload["screenHeight"] = AnyCodable(device.screenHeight)
             payload["screenDensity"] = AnyCodable(device.screenDensity)
             payload["locale"] = AnyCodable(device.locale)
             payload["timezone"] = AnyCodable(device.timezone)
-            payload["carrier"] = AnyCodable(device.carrier)
-            payload["totalDisk"] = AnyCodable(device.totalDisk)
-            payload["totalRam"] = AnyCodable(device.totalRam)
             payload["brand"] = AnyCodable(device.brand)
+            payload["carrier"] = AnyCodable(device.carrier)
+            // Int, not the source UInt64: AnyCodable encodes Bool/Int/Double/String and
+            // throws on anything else, and a throw here fails the encode of the WHOLE
+            // event body. Byte counts fit Int64 with room to spare.
+            payload["totalRam"] = AnyCodable(Int(device.totalRam))
+            payload["totalDisk"] = AnyCodable(Int(device.totalDisk))
+            payload["freeDisk"] = AnyCodable(Int(device.freeDisk))
         }
 
-        // Ad IDs
-        if let ads = advertisingIds {
-            if let idfa = ads.idfa { payload["idfa"] = AnyCodable(idfa) }
-            if let idfv = ads.idfv { payload["idfv"] = AnyCodable(idfv) }
-            payload["attStatus"] = AnyCodable(ads.attStatus.rawValue)
+        if let anonId = effectiveAnonId { payload["fbAnonId"] = AnyCodable(anonId) }
+
+        if let referrer = referrer {
+            payload["installReferrer"] = AnyCodable(referrer.rawReferrer)
+            payload["install_referrer_raw"] = AnyCodable(referrer.raw)
+            payload["install_referrer_source"] = AnyCodable("meta_deferred")
+            if let v = referrer.trackingId { payload["referrerTrackingId"] = AnyCodable(v) }
+            if let v = referrer.fbclid { payload["referrerFbclid"] = AnyCodable(v) }
+            if let v = referrer.utmSource { payload["referrerUtmSource"] = AnyCodable(v) }
+            if let v = referrer.utmMedium { payload["referrerUtmMedium"] = AnyCodable(v) }
+            if let v = referrer.utmCampaign { payload["referrerUtmCampaign"] = AnyCodable(v) }
+            if let v = referrer.ttclid { payload["ttclid"] = AnyCodable(v) }
         }
 
-        // Attribution
-        if let attr = attribution {
-            if let fbclid = attr.fbclid { payload["fbclid"] = AnyCodable(fbclid) }
-            if let gclid = attr.gclid { payload["gclid"] = AnyCodable(gclid) }
-            if let ttclid = attr.ttclid { payload["ttclid"] = AnyCodable(ttclid) }
-        }
+        if let idfa = advertisingIds?.idfa { payload["idfa"] = AnyCodable(idfa) }
+        if let idfv = advertisingIds?.idfv { payload["idfv"] = AnyCodable(idfv) }
 
-        // FB Anonymous ID
-        if let fbAnonId = fbAnonymousId {
-            payload["fbAnonId"] = AnyCodable(fbAnonId)
-        }
-
-        // Track the event with critical priority.
-        // Uses "$app_installed" (custom family) to match the RN SDK's InstallTracker —
-        // this is the event the server's attribution pipeline listens for (IDFA/IDFV
-        // deferred match, CAPI). The canonical lifecycle install event (type:"install")
-        // is emitted separately by AutoEvents using the firstSeen guard.
+        // Install is a one-shot, non-recoverable event — dispatched as `critical` so it
+        // posts directly and, on failure, lands in PendingRetry instead of queueing
+        // behind normal events. `installEventId` is stable across retries so the backend
+        // deduplicates repeated dispatches.
         await trackEvent("$app_installed", payload, .critical)
 
-        // Mark as tracked
-        await storage.set(PaywalloConstants.installTrackedKey, value: "1")
-    }
-
-    /// Get or create stable install event ID
-    private func getOrCreateInstallEventId(idfv: String? = nil, appKey: String? = nil) async -> String {
-        if let existing = await storage.get(PaywalloConstants.installEventIdKey) {
-            return existing
-        }
-        let id: String
-        if let idfv = idfv, !idfv.isEmpty, let appKey = appKey, !appKey.isEmpty {
-            id = deterministicUUID(from: "\(idfv):\(appKey)")
-        } else {
-            id = UUID().uuidString
-        }
-        await storage.set(PaywalloConstants.installEventIdKey, value: id)
-        return id
-    }
-
-    /// Derives a stable UUID-like string from a seed string using SHA256.
-    private func deterministicUUID(from seed: String) -> String {
-        let data = Data(seed.utf8)
-        var hash = [UInt8](repeating: 0, count: 32)
-        data.withUnsafeBytes { ptr in
-            _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &hash)
-        }
-        let hex = hash.prefix(16).map { String(format: "%02x", $0) }.joined()
-        let p1 = String(hex.prefix(8))
-        let p2 = String(hex.dropFirst(8).prefix(4))
-        let p3 = String(hex.dropFirst(12).prefix(4))
-        let p4 = String(hex.dropFirst(16).prefix(4))
-        let p5 = String(hex.dropFirst(20).prefix(12))
-        return "\(p1)-\(p2)-\(p3)-\(p4)-\(p5)".uppercased()
-    }
-
-    /// Deferred match — POST /sdk/attribution/deferred-match/{appKey}
-    /// Best-effort, doesn't block init.
-    ///
-    /// NOTE: The server route param is named `:appId` (UUID) in some controller versions,
-    /// but `PaywalloConfig` only exposes `appKey` (string). If the server looks up by appId
-    /// (UUID), this call will fail with 404. Update this path to use the appId UUID once
-    /// it is available in the SDK config.
-    public func performDeferredMatch(
-        appKey: String,
-        httpClient: HttpClient,
-        deviceData: DeviceData?,
-        advertisingIds: AdvertisingIdResult?,
-        fbAnonymousId: String? = nil,
-        attributionTracker: AttributionTracker? = nil
-    ) async {
-        // Idempotency check
-        let done = await storage.get(PaywalloConstants.deferredMatchDoneKey)
-        if done != nil { return }
-
-        let installTimestamp = ISO8601DateFormatter().string(from: Date())
-        var body: [String: AnyCodable] = [
-            "platform": AnyCodable("ios"),
-            "installTimestamp": AnyCodable(installTimestamp),
-        ]
-
-        if let device = deviceData {
-            body["deviceModel"] = AnyCodable(device.modelId)
-            body["osVersion"] = AnyCodable(device.systemVersion)
-            body["language"] = AnyCodable(device.locale)
-            body["timezone"] = AnyCodable(device.timezone)
-            body["screenWidth"] = AnyCodable(Int(device.screenWidth))
-            body["screenHeight"] = AnyCodable(Int(device.screenHeight))
-            // country is used by the server for probabilistic matching
-            if !device.locale.isEmpty {
-                // locale is e.g. "en_BR" — extract country code after underscore
-                let parts = device.locale.components(separatedBy: "_")
-                if parts.count >= 2 { body["country"] = AnyCodable(parts.last!) }
-            }
-        }
-
-        if let ads = advertisingIds {
-            if let idfa = ads.idfa { body["idfa"] = AnyCodable(idfa) }
-            if let idfv = ads.idfv { body["idfv"] = AnyCodable(idfv) }
-        }
-
-        if let fbAnonId = fbAnonymousId { body["fbAnonId"] = AnyCodable(fbAnonId) }
-
-        do {
-            let jsonData = try JSONEncoder().encode(body)
-            let options = RequestOptions(
-                method: "POST",
-                body: jsonData,
-                skipRetry: true,
-                timeout: 5
+        // Fire-and-forget: the deferred match must never delay the install dispatch.
+        let scheduler = retryScheduler
+        Task {
+            await scheduler.start(
+                apiClient: apiClient,
+                distinctId: distinctId,
+                deviceData: deviceData,
+                country: country,
+                idfv: advertisingIds?.idfv,
+                anonId: effectiveAnonId,
+                installedAt: installedAt,
+                rawReferrer: referrer?.rawReferrer
             )
-
-            struct DeferredMatchResponse: Decodable {
-                let fbclid: String?
-                let gclid: String?
-                let ttclid: String?
-                let utmSource: String?
-                let utmMedium: String?
-                let utmCampaign: String?
-                let utmContent: String?
-                let utmTerm: String?
-                let referrer: String?
-            }
-
-            let response: HttpResponse<DeferredMatchResponse> = try await httpClient.request(
-                path: "/sdk/attribution/deferred-match/\(appKey)",
-                options: options
-            )
-
-            // Apply server match result to attributionTracker (first-write-wins)
-            if let tracker = attributionTracker {
-                let r = response.data
-                let input = AttributionInput(
-                    utmSource: r.utmSource,
-                    utmMedium: r.utmMedium,
-                    utmCampaign: r.utmCampaign,
-                    utmContent: r.utmContent,
-                    utmTerm: r.utmTerm,
-                    fbclid: r.fbclid,
-                    gclid: r.gclid,
-                    ttclid: r.ttclid,
-                    referrer: r.referrer
-                )
-                await tracker.capture(input)
-            }
-        } catch {
-            // Best-effort — don't block
         }
 
-        // Mark as done regardless of success
-        await storage.set(PaywalloConstants.deferredMatchDoneKey, value: "1")
+        await InstallIdempotency.markInstallTracked(storage: storage, installedAt: installedAt)
+        return true
     }
+
+    // MARK: - Private helpers
+
+    /// Meta's own anon id when the FB SDK answered; otherwise the persisted local one;
+    /// otherwise a fresh `PW_` id. The `PW_` value is NOT a real `_fbp` — Meta does not
+    /// recognise it — but a stable per-device id still lets the server stitch the install
+    /// to later events, which is what it is for.
+    private func resolveAnonId(_ fbAnonymousId: String?) async -> String? {
+        if let fbAnonymousId = fbAnonymousId, !fbAnonymousId.isEmpty { return fbAnonymousId }
+
+        if let stored = await storage.get(PaywalloConstants.anonIdKey), !stored.isEmpty {
+            return stored
+        }
+
+        let generated = "PW_\(UUID().uuidString)"
+        if debug {
+            print("[Paywallo:Install] fb_anon_id: generated local PW_ (Facebook SDK absent in host? real _fbp unavailable — Meta does not recognise PW_)")
+        }
+        await storage.set(PaywalloConstants.anonIdKey, value: generated)
+        return generated
+    }
+
+    /// Same policy as the session guard: poll briefly rather than fail the install on a
+    /// cold-start race with identity init. Returns nil on timeout so the caller skips
+    /// WITHOUT marking anything — the next boot retries.
+    private func waitForDistinctId(_ provider: @escaping () -> String) async -> String? {
+        for _ in 0..<10 {
+            let id = provider()
+            if !id.isEmpty { return id }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        let last = provider()
+        return last.isEmpty ? nil : last
+    }
+}
+
+/// Region for the server's probabilistic match. `Locale.region` needs macOS 13 and the
+/// package still builds for macOS 12, so the deprecated accessor stays as the fallback.
+func installRegionCode() -> String? {
+    let code: String?
+    if #available(iOS 16.0, macOS 13.0, *) {
+        code = Locale.current.region?.identifier
+    } else {
+        code = Locale.current.regionCode
+    }
+    guard let code = code, !code.isEmpty else { return nil }
+    return code
 }

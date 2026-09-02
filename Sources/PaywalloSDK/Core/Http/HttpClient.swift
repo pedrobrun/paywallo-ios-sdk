@@ -1,5 +1,55 @@
 import Foundation
 
+/// A certificate/TLS failure is not transient — "certificate issues are not transient".
+/// Retrying it burns battery and radio for an outcome that cannot change, so both retry
+/// layers (this one and `runWithRetryPolicy`) stop on the first attempt and hand the
+/// request straight to the backstop: `PendingRetry` for critical, drop for normal.
+enum SslError {
+    private static let urlErrorCodes: Set<URLError.Code> = [
+        .secureConnectionFailed,
+        .serverCertificateHasBadDate,
+        .serverCertificateUntrusted,
+        .serverCertificateHasUnknownRoot,
+        .serverCertificateNotYetValid,
+        .clientCertificateRejected,
+        .clientCertificateRequired,
+    ]
+
+    /// Message fallbacks for the errors that reach us as plain `NSError` (proxies, custom
+    /// `URLSession` delegates, pinning libraries) instead of a typed `URLError`.
+    private static let messagePatterns = [
+        "certificate",
+        "cert_",
+        "x509",
+        " ssl",
+        "tls handshake",
+        "unable to verify the first certificate",
+        "self signed certificate",
+        "err_cert",
+    ]
+
+    static func matches(_ error: Error) -> Bool {
+        if let urlError = error as? URLError, urlErrorCodes.contains(urlError.code) { return true }
+        let message = error.localizedDescription.lowercased()
+        return messagePatterns.contains { message.contains($0) }
+    }
+}
+
+/// RFC 7231 IMF-fixdate parser for the `Retry-After` header, shared by the two retry
+/// layers (this client's per-request loop and `runWithRetryPolicy`).
+enum HttpDate {
+    private static let formatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
+
+    static func parse(_ value: String) -> Date? {
+        formatter.date(from: value)
+    }
+}
+
 public struct HttpResponse<T> {
     public let ok: Bool
     public let status: Int
@@ -248,6 +298,9 @@ public final class HttpClient {
     // MARK: - Retry helpers
 
     private func isNetworkError(_ error: Error) -> Bool {
+        // Checked first: a TLS failure arrives as a `URLError` too, and treating it as a
+        // transient network error retried the same doomed handshake three times per request.
+        if SslError.matches(error) { return false }
         if error is URLError { return true }
         let message = error.localizedDescription.lowercased()
         return ["network", "timeout", "connection"].contains(where: message.contains)
@@ -267,10 +320,7 @@ public final class HttpClient {
                 return min(seconds, retryConfig.maxDelay)
             }
             // Try HTTP-date format
-            let formatter = DateFormatter()
-            formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
-            formatter.locale = Locale(identifier: "en_US_POSIX")
-            if let date = formatter.date(from: retryAfter) {
+            if let date = HttpDate.parse(retryAfter) {
                 let interval = date.timeIntervalSinceNow
                 if interval > 0 { return min(interval, retryConfig.maxDelay) }
             }

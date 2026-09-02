@@ -59,10 +59,48 @@ final class ApiCacheTests: XCTestCase {
         XCTAssertFalse(cache.isStale("fresh:key"))
     }
 
-    func testIsStaleReturnsFalseForNilTTL() {
-        // nil TTL = permanent, never expired
-        cache.set("permanent:key", value: "forever", ttl: nil)
-        XCTAssertFalse(cache.isStale("permanent:key"))
+    func testOmittedTTLUsesDefaultTTL() {
+        cache.set("default:key", value: "x")
+        XCTAssertFalse(cache.isStale("default:key"), "sem ttl explícito vale o defaultTTL de 300s")
+        let value: String? = cache.get("default:key")
+        XCTAssertEqual(value, "x")
+    }
+
+    func testDefaultConstantsMatchTheWireContract() {
+        XCTAssertEqual(ApiCache.defaultTTL, 300)
+        XCTAssertEqual(ApiCache.defaultNullTTL, 30)
+        XCTAssertEqual(ApiCache.staleWindow, 86_400)
+        XCTAssertEqual(ApiCache.maxSize, 200)
+    }
+
+    func testDefaultNullTTLIs30Seconds() {
+        // Um paywall publicado no meio da sessão ficava invisível por 60s com o TTL antigo.
+        let defaultCache = ApiCache()
+        defaultCache.setNull("paywall:new")
+        XCTAssertTrue(defaultCache.isNull("paywall:new"))
+    }
+
+    func testEvictionKeepsLiveEntriesPastMaxSize() {
+        let big = ApiCache()
+        for index in 0...(ApiCache.maxSize + 10) {
+            big.set("key:\(index)", value: index, ttl: 300)
+        }
+        // Nada expirou, então nada pode ter sido descartado.
+        let first: Int? = big.get("key:0")
+        let last: Int? = big.get("key:\(ApiCache.maxSize + 10)")
+        XCTAssertEqual(first, 0, "entrada viva não pode ser evictada só por causa do cap")
+        XCTAssertEqual(last, ApiCache.maxSize + 10)
+    }
+
+    func testEvictionDropsExpiredEntriesPastMaxSize() {
+        let big = ApiCache()
+        for index in 0..<(ApiCache.maxSize + 1) {
+            big.set("expired:\(index)", value: index, ttl: 0.001)
+        }
+        Thread.sleep(forTimeInterval: 0.05)
+        big.set("fresh:key", value: 1, ttl: 300)
+        let expired: Int? = big.get("expired:0")
+        XCTAssertNil(expired, "entradas vencidas saem quando o cap é ultrapassado")
     }
 
     func testIsStaleReturnsFalseForMissingKey() {

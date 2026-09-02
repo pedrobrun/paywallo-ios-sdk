@@ -74,6 +74,42 @@ public enum IdentityStorage {
         }
     }
 
+    /// Persist anonId durably: retries the Keychain write, then falls back to regular
+    /// storage (UserDefaults).
+    ///
+    /// Without the fallback, a cold start on a locked device finds the Keychain
+    /// unavailable, loses the anonId across boots and mints a new UUID — which inflated
+    /// distinct_id counts on iOS by roughly 30%. Not sensitive: anonId is a random UUID
+    /// with no PII, so durability outranks secrecy here.
+    public static func persistAnonIdDurably(storage: SecureStorage, anonId: String) async {
+        var stored = await storage.set(PaywalloConstants.anonIdKey, value: anonId)
+
+        var attempt = 0
+        while !stored && attempt < PaywalloConstants.anonIdSetRetries {
+            try? await Task.sleep(nanoseconds: UInt64(PaywalloConstants.anonIdRetryDelayMs) * 1_000_000)
+            stored = await storage.set(PaywalloConstants.anonIdKey, value: anonId)
+            attempt += 1
+        }
+
+        if !stored {
+            storage.nativeStorage.set(PaywalloConstants.anonIdFallbackKey, value: anonId)
+        }
+    }
+
+    /// Read anonId from the Keychain; if absent, check the regular-storage fallback
+    /// written by `persistAnonIdDurably`. Returns nil ONLY when both sources came back
+    /// empty — the caller must not regenerate before that is established.
+    public static func readAnonIdDurably(storage: SecureStorage) async -> String? {
+        if let secure = await readWithMigration(
+            storage: storage,
+            newKey: PaywalloConstants.anonIdKey,
+            legacyKey: PaywalloConstants.legacyAnonIdKey
+        ) {
+            return secure
+        }
+        return storage.nativeStorage.get(PaywalloConstants.anonIdFallbackKey)
+    }
+
     /// Read PII with migration from legacy @panel: key to new @paywallo: key.
     public static func readWithPiiMigration(
         storage: SecureStorage,

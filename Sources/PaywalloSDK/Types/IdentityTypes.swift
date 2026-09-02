@@ -13,6 +13,9 @@ public struct IdentifyOptions: Codable, Sendable {
     public var lastName: String?
     public var dateOfBirth: String?  // YYYY-MM-DD
     public var gender: Gender?
+    /// CEP. Enviado top-level no body do identify (não dentro de `traits`), com trim,
+    /// e omitido quando vazio. Alimenta o matching do CAPI.
+    public var zipCode: String?
 
     public init(
         email: String? = nil,
@@ -21,7 +24,8 @@ public struct IdentifyOptions: Codable, Sendable {
         firstName: String? = nil,
         lastName: String? = nil,
         dateOfBirth: String? = nil,
-        gender: Gender? = nil
+        gender: Gender? = nil,
+        zipCode: String? = nil
     ) {
         self.email = email
         self.properties = properties
@@ -30,6 +34,7 @@ public struct IdentifyOptions: Codable, Sendable {
         self.lastName = lastName
         self.dateOfBirth = dateOfBirth
         self.gender = gender
+        self.zipCode = zipCode
     }
 }
 

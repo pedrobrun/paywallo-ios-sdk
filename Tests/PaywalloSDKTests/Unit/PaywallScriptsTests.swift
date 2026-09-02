@@ -113,6 +113,53 @@ final class PaywallScriptsTests: XCTestCase {
         XCTAssertTrue(script.contains("secondaryProductId:\"com.app.annual\""))
     }
 
+    func testBuildPaywallDataScript_tertiaryProductIdIsNull_whenNil() {
+        let script = PaywallScripts.buildPaywallDataScript(
+            craftData: "{}",
+            products: [],
+            primaryProductId: nil,
+            secondaryProductId: nil
+        )
+        XCTAssertTrue(script.contains("tertiaryProductId:null"))
+    }
+
+    func testBuildPaywallDataScript_tertiaryProductIdIsQuoted_whenProvided() {
+        let script = PaywallScripts.buildPaywallDataScript(
+            craftData: "{}",
+            products: [],
+            primaryProductId: nil,
+            secondaryProductId: nil,
+            tertiaryProductId: "com.app.lifetime"
+        )
+        XCTAssertTrue(script.contains("tertiaryProductId:\"com.app.lifetime\""))
+    }
+
+    // MARK: - buildPaywallDataScript languages
+
+    func testBuildPaywallDataScript_includesCurrentLanguage() {
+        let script = PaywallScripts.buildPaywallDataScript(
+            craftData: "{}",
+            products: [],
+            primaryProductId: nil,
+            secondaryProductId: nil
+        )
+        // O renderer web resolve as strings localizadas do craft com estes dois campos.
+        XCTAssertTrue(
+            script.contains("currentLanguage:\"\(Localization.shared.getCurrentLanguage())\""),
+            "currentLanguage must carry the language the SDK resolved, got: \(script)"
+        )
+    }
+
+    func testBuildPaywallDataScript_includesDefaultLanguage() {
+        let script = PaywallScripts.buildPaywallDataScript(
+            craftData: "{}",
+            products: [],
+            primaryProductId: nil,
+            secondaryProductId: nil
+        )
+        XCTAssertTrue(script.contains("defaultLanguage:\"\(Localization.defaultLanguage)\""))
+    }
+
     func testBuildPaywallDataScript_returnsTrue_atEnd() {
         let script = PaywallScripts.buildPaywallDataScript(
             craftData: "{}",

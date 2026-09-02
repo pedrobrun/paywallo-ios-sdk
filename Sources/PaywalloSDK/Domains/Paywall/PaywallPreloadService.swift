@@ -8,6 +8,20 @@ public struct PreloadedPaywallSnapshot: Sendable {
     public let products: [String: Product]
 }
 
+// MARK: - Preload result
+
+/// Resultado de um `preload`. O caller precisa distinguir "esse placement não existe"
+/// de "a rede caiu" — engolir os dois num log deixava o app sem como reagir.
+public struct PreloadPaywallResult: @unchecked Sendable {
+    public let success: Bool
+    public let error: Error?
+
+    public init(success: Bool, error: Error? = nil) {
+        self.success = success
+        self.error = error
+    }
+}
+
 // MARK: - PreloadEntry (private)
 
 private struct PaywallPreloadEntry {
@@ -61,7 +75,7 @@ public final class PaywallPreloadService: @unchecked Sendable {
 
     private let lock = NSLock()
     private var cache: [String: PaywallPreloadEntry] = [:]
-    private var inFlight: [String: Task<Void, Never>] = [:]
+    private var inFlight: [String: Task<PreloadPaywallResult, Never>] = [:]
 
     // MARK: - Init
 
@@ -84,40 +98,45 @@ public final class PaywallPreloadService: @unchecked Sendable {
     /// Preloads a single paywall placement into the cache.
     /// Returns immediately if the placement is already cached and fresh.
     /// Deduplicates concurrent calls for the same placement.
-    public func preload(_ placement: String) async {
+    @discardableResult
+    public func preload(_ placement: String) async -> PreloadPaywallResult {
         // Return immediately if cache is fresh
         if let cached = getCached(placement), !cached.isExpired {
             if cached.isStale {
                 triggerBackgroundRevalidate(placement)
             }
-            return
+            return PreloadPaywallResult(success: true)
         }
 
         // Dedup: await existing in-flight task
         if let existing = getInFlight(placement) {
-            await existing.value
-            return
+            return await existing.value
         }
 
-        let task = Task<Void, Never> {
+        let task = Task<PreloadPaywallResult, Never> {
             defer { self.removeInFlight(placement) }
-            await self.fetchAndCache(placement)
+            return await self.fetchAndCache(placement)
         }
         setInFlight(placement, task: task)
-        await task.value
+        return await task.value
     }
 
-    /// Preloads multiple placements with a 200ms stagger between them.
-    /// Errors from individual placements are swallowed so one failure
-    /// does not abort others.
+    /// Preloads multiple placements, disparando cada um com 200ms de intervalo mas
+    /// SEM esperar o anterior terminar: serializado, cada placement pagava rede +
+    /// StoreKit do anterior e a fila inteira levava segundos. Erros individuais são
+    /// engolidos — uma falha não pode abortar as outras, e `presentPaywall` cai no
+    /// fetch direto quando o cache erra.
     public func preloadMany(_ placements: [String]) async {
         guard !placements.isEmpty else { return }
         log("preloading \(placements.count) placements")
-        for (index, placement) in placements.enumerated() {
-            if index > 0 {
-                try? await Task.sleep(nanoseconds: UInt64(staggerDelay * 1_000_000_000))
+        await withTaskGroup(of: Void.self) { group in
+            for (index, placement) in placements.enumerated() {
+                if index > 0 {
+                    // Stagger para não martelar a API na inicialização.
+                    try? await Task.sleep(nanoseconds: UInt64(staggerDelay * 1_000_000_000))
+                }
+                group.addTask { _ = await self.preload(placement) }
             }
-            await preload(placement)
         }
     }
 
@@ -174,7 +193,7 @@ public final class PaywallPreloadService: @unchecked Sendable {
 
     // MARK: - Private: Fetch & Cache
 
-    private func fetchAndCache(_ placement: String) async {
+    private func fetchAndCache(_ placement: String) async -> PreloadPaywallResult {
         do {
             let config = try await apiClient.getPaywall(placement)
             let products = await loadProducts(for: config)
@@ -186,15 +205,33 @@ public final class PaywallPreloadService: @unchecked Sendable {
             )
             setCache(placement, entry: entry)
             log("cached placement: \(placement)")
+            return PreloadPaywallResult(success: true)
         } catch {
-            log("preload failed for \(placement): \(error.localizedDescription)")
+            let mapped = mapPreloadError(error, placement: placement)
+            log("preload failed for \(placement): \(mapped)")
+            return PreloadPaywallResult(success: false, error: mapped)
         }
+    }
+
+    /// Erro do domínio (já classificado pela camada de API) passa direto. O transporte
+    /// não lança em 404 — um placement inexistente volta com corpo que não decodifica
+    /// em `PaywallConfig`, que é o "config nulo" do RN.
+    private func mapPreloadError(_ error: Error, placement: String) -> Error {
+        if let known = error as? PaywalloError { return known }
+        if error is DecodingError {
+            return PaywallDomainError(
+                code: PaywallErrorCode.notFound,
+                message: "Paywall not found for placement: \(placement)"
+            )
+        }
+        return PaywallDomainError(code: PaywallErrorCode.loadFailed, message: String(describing: error))
     }
 
     private func loadProducts(for config: PaywallConfig) async -> [String: Product] {
         var ids: [String] = []
         if let p = config.primaryProductId { ids.append(p) }
         if let s = config.secondaryProductId { ids.append(s) }
+        if let t = config.tertiaryProductId { ids.append(t) }
         guard !ids.isEmpty else { return [:] }
 
         let loaded = await iapService.loadProducts(productIds: ids)
@@ -205,9 +242,9 @@ public final class PaywallPreloadService: @unchecked Sendable {
 
     private func triggerBackgroundRevalidate(_ placement: String) {
         guard getInFlight(placement) == nil else { return }
-        let task = Task<Void, Never> {
+        let task = Task<PreloadPaywallResult, Never> {
             defer { self.removeInFlight(placement) }
-            await self.fetchAndCache(placement)
+            return await self.fetchAndCache(placement)
         }
         setInFlight(placement, task: task)
     }
@@ -232,13 +269,13 @@ public final class PaywallPreloadService: @unchecked Sendable {
         cache.removeValue(forKey: placement)
     }
 
-    private func getInFlight(_ placement: String) -> Task<Void, Never>? {
+    private func getInFlight(_ placement: String) -> Task<PreloadPaywallResult, Never>? {
         lock.lock()
         defer { lock.unlock() }
         return inFlight[placement]
     }
 
-    private func setInFlight(_ placement: String, task: Task<Void, Never>) {
+    private func setInFlight(_ placement: String, task: Task<PreloadPaywallResult, Never>) {
         lock.lock()
         defer { lock.unlock() }
         inFlight[placement] = task

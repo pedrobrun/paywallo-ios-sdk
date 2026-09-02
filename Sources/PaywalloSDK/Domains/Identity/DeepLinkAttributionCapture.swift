@@ -5,20 +5,56 @@ import UIKit
 
 public final class DeepLinkAttributionCapture {
     private let attributionTracker: AttributionTracker
+    private let debug: Bool
     private var started = false
+    private var launchObserver: NSObjectProtocol?
 
-    public init(attributionTracker: AttributionTracker) {
+    public init(attributionTracker: AttributionTracker, debug: Bool = false) {
         self.attributionTracker = attributionTracker
+        self.debug = debug
     }
 
-    /// Start listening for deep links. Call once on SDK init.
+    deinit {
+        if let observer = launchObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    /// Start capturing deep-link attribution. Call once on SDK init.
+    ///
+    /// Cold start: observes `didFinishLaunching`, whose userInfo carries the URL the app
+    /// was opened with. That is the only cold-start URL a library can see without the
+    /// host wiring anything, and it is the one that matters — the click that produced
+    /// the install arrives exactly there.
+    ///
+    /// Warm start: the host forwards `handleUrl(_:)` from its
+    /// `AppDelegate`/`SceneDelegate` URL callbacks.
+    ///
+    /// Every failure is swallowed: attribution is best-effort and must never break init.
     public func start() {
         guard !started else { return }
         started = true
 
-        // Note: On iOS, deep link handling is typically done via
-        // UIApplicationDelegate or SceneDelegate methods.
-        // The SDK consumer should call handleUrl(_:) from those callbacks.
+        #if canImport(UIKit)
+        launchObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didFinishLaunchingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self = self,
+                  let url = notification.userInfo?[UIApplication.LaunchOptionsKey.url] as? URL
+            else { return }
+            Task { await self.handleUrl(url) }
+        }
+        #endif
+    }
+
+    public func stop() {
+        if let observer = launchObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        launchObserver = nil
+        started = false
     }
 
     /// Handle an incoming URL (deep link). Call from AppDelegate/SceneDelegate.
@@ -41,7 +77,7 @@ public final class DeepLinkAttributionCapture {
             utmContent: params["utm_content"],
             utmTerm: params["utm_term"],
             fbclid: params["fbclid"],
-            gclid: params["gclid"],
+            gclid: sanitizeGclid(params["gclid"]),
             ttclid: params["ttclid"],
             tiktokCampaignId: params["campaign_id"],
             tiktokAdgroupId: params["adgroup_id"],
@@ -54,6 +90,16 @@ public final class DeepLinkAttributionCapture {
         // Return nil if no attribution fields present
         guard input.hasAnyField else { return nil }
         return input
+    }
+
+    /// Google Ads ValueTrack macros are sometimes left unsubstituted by the ad network,
+    /// so the literal `{gclid}` arrives as the value. Storing it poisons the capture:
+    /// it is a strong signal by shape, so first-write-wins would then reject the real
+    /// click ID that shows up later.
+    private func sanitizeGclid(_ value: String?) -> String? {
+        guard let value = value else { return nil }
+        if value.hasPrefix("{") && value.hasSuffix("}") { return nil }
+        return value
     }
 
     /// Manual query parameter parser that handles + → space correctly

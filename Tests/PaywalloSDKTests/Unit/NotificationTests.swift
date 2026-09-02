@@ -675,3 +675,153 @@ final class NotificationHandlersTests: XCTestCase {
         XCTAssertTrue(calls[0].hasPrefix("first:"))
     }
 }
+
+// MARK: - Pre-prompt / Permission Tests
+
+private final class SpyPrePromptTracker: PrePromptTracker {
+    var events: [PromptEventType] = []
+
+    func trackPromptEvent(_ event: PromptEventType) {
+        events.append(event)
+    }
+}
+
+final class NotificationPrePromptTests: XCTestCase {
+
+    private var tracker: SpyPrePromptTracker!
+    private var permissionManager: PermissionManager!
+
+    override func setUp() {
+        super.setUp()
+        tracker = SpyPrePromptTracker()
+        permissionManager = PermissionManager(debug: false, tracker: tracker)
+    }
+
+    func testPrePrompt_emitsPromptShownOnOpen() {
+        _ = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "Stay in the loop", body: "Get notified")
+        )
+
+        XCTAssertEqual(tracker.events, [.promptShown])
+    }
+
+    func testPrePrompt_handleCarriesTheCopyVerbatim() {
+        let handle = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "T", body: "B", acceptLabel: "Sure", rejectLabel: "Later")
+        )
+
+        XCTAssertEqual(handle.title, "T")
+        XCTAssertEqual(handle.body, "B")
+        XCTAssertEqual(handle.acceptLabel, "Sure")
+        XCTAssertEqual(handle.rejectLabel, "Later")
+    }
+
+    func testPrePrompt_rejectEmitsSoftRejectedAndLeavesPermissionUndecided() {
+        let handle = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "T", body: "B")
+        )
+
+        XCTAssertEqual(handle.reject(), .notDetermined)
+        XCTAssertEqual(tracker.events, [.promptShown, .softRejected])
+    }
+
+    func testPrePrompt_rejectIsIdempotent() {
+        let handle = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "T", body: "B")
+        )
+
+        handle.reject()
+        handle.reject()
+
+        XCTAssertEqual(tracker.events, [.promptShown, .softRejected])
+    }
+
+    func testPrePrompt_acceptEmitsSoftAccepted() async {
+        let handle = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "T", body: "B")
+        )
+
+        _ = await handle.accept()
+
+        XCTAssertEqual(tracker.events.prefix(2).map { $0 }, [.promptShown, .softAccepted])
+    }
+
+    func testPrePrompt_acceptIsIdempotent() async {
+        let handle = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "T", body: "B")
+        )
+
+        _ = await handle.accept()
+        _ = await handle.accept()
+
+        XCTAssertEqual(tracker.events.filter { $0 == .softAccepted }.count, 1)
+    }
+
+    func testPrePrompt_acceptAfterRejectDoesNotReopenTheOsDialog() async {
+        let handle = permissionManager.requestPermissionWithPrePrompt(
+            PrePromptOptions(title: "T", body: "B")
+        )
+
+        handle.reject()
+        _ = await handle.accept()
+
+        XCTAssertEqual(tracker.events, [.promptShown, .softRejected])
+    }
+
+    func testPromptEventType_wireValues() {
+        XCTAssertEqual(PromptEventType.promptShown.rawValue, "prompt_shown")
+        XCTAssertEqual(PromptEventType.softAccepted.rawValue, "soft_accepted")
+        XCTAssertEqual(PromptEventType.softRejected.rawValue, "soft_rejected")
+        XCTAssertEqual(PromptEventType.osGranted.rawValue, "os_granted")
+        XCTAssertEqual(PromptEventType.osDenied.rawValue, "os_denied")
+    }
+
+    /// Outside an .app bundle (CLI / XCTest) UNUserNotificationCenter is unreachable,
+    /// so the status is unknown rather than denied.
+    func testGetStatus_outsideAppContext_isNotDetermined() async {
+        let status = await permissionManager.getStatus()
+
+        XCTAssertEqual(status, .notDetermined)
+    }
+}
+
+// MARK: - Notification subscriber accumulation
+
+final class NotificationSubscriberTests: XCTestCase {
+
+    private func makePayload(_ messageId: String) -> NotificationPayload {
+        NotificationPayload(userInfo: ["message_id": messageId])
+    }
+
+    func testOnReceived_secondSubscriberDoesNotReplaceTheFirst() {
+        var handlers = NotificationHandlers()
+        var first: [String] = []
+        var second: [String] = []
+
+        // Mirrors the fan-out NotificationsManager installs for its callback array.
+        var callbacks: [(NotificationPayload) -> Void] = []
+        handlers.onReceived = { payload in callbacks.forEach { $0(payload) } }
+        callbacks.append { first.append($0.messageId ?? "") }
+        callbacks.append { second.append($0.messageId ?? "") }
+
+        handlers.handleReceived(makePayload("m1"))
+
+        XCTAssertEqual(first, ["m1"])
+        XCTAssertEqual(second, ["m1"])
+    }
+
+    func testPeekOpened_doesNotConsumeTheBuffer() {
+        let handlers = NotificationHandlers()
+        handlers.handleOpened(makePayload("cold_start"))
+
+        XCTAssertEqual(handlers.peekOpened()?.messageId, "cold_start")
+        // The subscriber that attaches later must still receive it.
+        XCTAssertEqual(handlers.drainOpened().count, 1)
+    }
+
+    func testPeekOpened_emptyBuffer_isNil() {
+        let handlers = NotificationHandlers()
+
+        XCTAssertNil(handlers.peekOpened())
+    }
+}

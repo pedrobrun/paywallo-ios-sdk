@@ -48,30 +48,43 @@ public enum PaywallScripts {
 
     /// Builds the JS that sends paywall data to the web app.
     /// Mirrors the RN SDK wire format:
-    ///   `{ type: "paywall", data: { craftData, products, primaryProductId, secondaryProductId } }`
+    ///   `{ type: "paywall", data: { craftData, products, primaryProductId,
+    ///      secondaryProductId, tertiaryProductId, currentLanguage, defaultLanguage } }`
     /// Polls for `window.receiveNativeMessage` up to 50 times at 100 ms intervals,
     /// identical to the RN SDK polling pattern.
+    ///
+    /// `currentLanguage`/`defaultLanguage` são lidos aqui e não recebidos por parâmetro,
+    /// igual ao RN: o renderer web resolve as strings localizadas do craft com eles, e
+    /// deixar isso a cargo do caller já deu paywall renderizado no idioma errado.
     /// - Parameters:
     ///   - craftData: Serialized craft/config JSON string for the paywall renderer.
     ///   - products: Array of `Product` values — encoded to JSON via `JSONEncoder`.
     ///   - primaryProductId: Optional primary product identifier.
     ///   - secondaryProductId: Optional secondary product identifier.
+    ///   - tertiaryProductId: Optional tertiary product identifier.
     public static func buildPaywallDataScript(
         craftData: String,
         products: [Product],
         primaryProductId: String?,
-        secondaryProductId: String?
+        secondaryProductId: String?,
+        tertiaryProductId: String? = nil
     ) -> String {
         let productsJSON = encodeProductsJSON(products)
-        let primaryJSON = primaryProductId.map { "\"\($0.jsEscaped)\"" } ?? "null"
-        let secondaryJSON = secondaryProductId.map { "\"\($0.jsEscaped)\"" } ?? "null"
+        let primaryJSON = jsString(primaryProductId)
+        let secondaryJSON = jsString(secondaryProductId)
+        let tertiaryJSON = jsString(tertiaryProductId)
+        let currentLanguageJSON = jsString(Localization.shared.getCurrentLanguage())
+        let defaultLanguageJSON = jsString(Localization.defaultLanguage)
         let escapedCraftData = craftData.jsEscaped
 
         return "(function(){" +
             "var d={type:\"paywall\",data:{craftData:\"\(escapedCraftData)\"," +
             "products:\(productsJSON)," +
             "primaryProductId:\(primaryJSON)," +
-            "secondaryProductId:\(secondaryJSON)}};" +
+            "secondaryProductId:\(secondaryJSON)," +
+            "tertiaryProductId:\(tertiaryJSON)," +
+            "currentLanguage:\(currentLanguageJSON)," +
+            "defaultLanguage:\(defaultLanguageJSON)}};" +
             "var a=0,m=50;" +
             "function t(){a++;if(typeof window.receiveNativeMessage===\"function\"){window.receiveNativeMessage(d);return;}if(a<m){setTimeout(t,100);}}" +
             "t();" +
@@ -89,6 +102,12 @@ public enum PaywallScripts {
     }
 
     // MARK: - Private Helpers
+
+    /// Literal JS: string escapada entre aspas, ou `null`.
+    private static func jsString(_ value: String?) -> String {
+        guard let value = value else { return "null" }
+        return "\"\(value.jsEscaped)\""
+    }
 
     private static func encodeProductsJSON(_ products: [Product]) -> String {
         let encoder = JSONEncoder()

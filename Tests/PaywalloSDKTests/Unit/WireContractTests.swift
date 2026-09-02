@@ -97,7 +97,7 @@ final class WireContractTests: XCTestCase {
         ctx.ids          = ["idfv": AnyCodable("device-idfv-0001"), "fb_anon_id": AnyCodable("fb_anon_xyz")]
 
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .lifecycle, name: "lifecycle", payload: ["type": AnyCodable("cold_start")], timestamp: 1_715_000_000_000)],
+            events: [EventInput(family: .lifecycle, name: "lifecycle", payload: ["type": AnyCodable("cold_start")], timestamp: 1_715_000_000_000)],
             providerContext: ctx
         )
 
@@ -139,12 +139,86 @@ final class WireContractTests: XCTestCase {
         XCTAssertNil(context?["deviceModel"],  "DESVIO: camelCase 'deviceModel' vazou pro context wire")
     }
 
+    func testEnvelopeV2_newContextFieldsUseSnakeCaseAndNumericScreenMetrics() throws {
+        var ctx = IngestContext()
+        ctx.distinctId    = "user_abc123"
+        ctx.appBuild      = "4211"
+        ctx.bundleId      = "com.acme.app"
+        ctx.country       = "BR"
+        ctx.carrier       = "Vivo"
+        ctx.screenWidth   = 390
+        ctx.screenHeight  = 844
+        ctx.screenDensity = 3
+
+        let envelope = V2EnvelopeBuilder.build(
+            events: [EventInput(family: .lifecycle, name: "lifecycle",
+                                payload: ["type": AnyCodable("install")], timestamp: 1_715_000_000_000)],
+            providerContext: ctx
+        )
+
+        let data = try JSONEncoder().encode(envelope)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let context = json?["context"] as? [String: Any]
+
+        XCTAssertEqual(context?["app_build"] as? String, "4211")
+        XCTAssertEqual(context?["bundle_id"] as? String, "com.acme.app")
+        XCTAssertEqual(context?["country"] as? String, "BR")
+        XCTAssertEqual(context?["carrier"] as? String, "Vivo")
+
+        // Wire-contract: screen_* são números, não strings
+        XCTAssertEqual(context?["screen_width"] as? Double, 390)
+        XCTAssertEqual(context?["screen_height"] as? Double, 844)
+        XCTAssertEqual(context?["screen_density"] as? Double, 3)
+        XCTAssertNil(context?["screen_width"] as? String, "DESVIO: screen_width não pode virar string")
+
+        // camelCase não pode vazar
+        XCTAssertNil(context?["appBuild"])
+        XCTAssertNil(context?["bundleId"])
+        XCTAssertNil(context?["screenWidth"])
+        XCTAssertNil(context?["screenDensity"])
+    }
+
+    func testEnvelopeV2_appInstalledKeepsFlatScreenAndIdKeysInPayload() throws {
+        // O parser do $app_installed lê screenWidth/screenHeight/idfv do payload —
+        // promovê-los (e deletá-los) quebraria o evento.
+        let envelope = V2EnvelopeBuilder.build(
+            events: [EventInput(family: .custom, name: "$app_installed", payload: [
+                "screenWidth": AnyCodable(390),
+                "screenHeight": AnyCodable(844),
+                "idfv": AnyCodable("IDFV-0001"),
+                "installEventId": AnyCodable("3f2504e0-4f89-41d3-9a0c-0305e82c3301"),
+                "installClassification": AnyCodable("organic"),
+            ], timestamp: 1_715_000_000_000, distinctId: "user_wire")]
+        )
+
+        let data = try JSONEncoder().encode(envelope)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let event = (json?["events"] as? [[String: Any]])?.first
+        let payload = event?["payload"] as? [String: Any]
+
+        XCTAssertNotNil(payload?["screenWidth"], "DESVIO: screenWidth sumiu do payload do $app_installed")
+        XCTAssertNotNil(payload?["screenHeight"])
+        XCTAssertNotNil(payload?["idfv"], "ids são copiados pro context, não movidos")
+        XCTAssertEqual(payload?["event_name"] as? String, "$app_installed")
+
+        // installEventId vira o id do evento (dedup no servidor) e sai do payload
+        XCTAssertEqual(event?["id"] as? String, "3f2504e0-4f89-41d3-9a0c-0305e82c3301")
+        XCTAssertNil(payload?["installEventId"])
+
+        // installClassification é irmão de payload
+        XCTAssertEqual(event?["installClassification"] as? String, "organic")
+        XCTAssertNil(payload?["installClassification"])
+
+        let ids = (json?["context"] as? [String: Any])?["ids"] as? [String: Any]
+        XCTAssertEqual(ids?["idfv"] as? String, "IDFV-0001")
+    }
+
     // MARK: - 2. Envelope V2 — event structure (id, name, ts, payload)
 
     func testEnvelopeV2_eventHasRequiredFields() throws {
         let fixedTs: TimeInterval = 1_715_000_000_000
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .lifecycle, name: "lifecycle", payload: ["type": AnyCodable("cold_start")], timestamp: fixedTs)],
+            events: [EventInput(family: .lifecycle, name: "lifecycle", payload: ["type": AnyCodable("cold_start")], timestamp: fixedTs)],
             providerContext: nil
         )
 
@@ -183,7 +257,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_lifecycleFamily() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .lifecycle, name: "lifecycle",
+            events: [EventInput(family: .lifecycle, name: "lifecycle",
                       payload: ["type": AnyCodable("cold_start"), "session_id": AnyCodable("sess_001")],
                       timestamp: 1_715_000_000_000)],
             providerContext: nil
@@ -198,7 +272,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_identifyFamily() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .identify, name: "identify",
+            events: [EventInput(family: .identify, name: "identify",
                       payload: ["distinct_id": AnyCodable("u_001"), "email": AnyCodable("a@b.com")],
                       timestamp: 1_715_000_000_001)],
             providerContext: nil
@@ -212,7 +286,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_paywallFamily() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .paywall, name: "paywall",
+            events: [EventInput(family: .paywall, name: "paywall",
                       payload: ["type": AnyCodable("viewed"), "paywall_id": AnyCodable("pw_001")],
                       timestamp: 1_715_000_000_002)],
             providerContext: nil
@@ -224,7 +298,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_transactionFamily() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .transaction, name: "transaction",
+            events: [EventInput(family: .transaction, name: "transaction",
                       payload: [
                           "type": AnyCodable("completed"),
                           "transaction_id": AnyCodable("tx_001"),
@@ -241,7 +315,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_onboardingFamily() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .onboarding, name: "onboarding",
+            events: [EventInput(family: .onboarding, name: "onboarding",
                       payload: ["type": AnyCodable("step"), "step_name": AnyCodable("welcome"), "order": AnyCodable(1)],
                       timestamp: 1_715_000_000_004)],
             providerContext: nil
@@ -251,7 +325,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_notificationFamily() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .notification, name: "notification",
+            events: [EventInput(family: .notification, name: "notification",
                       payload: [
                           "type": AnyCodable("clicked"),
                           "notification_id": AnyCodable("notif_001"),
@@ -268,7 +342,7 @@ final class WireContractTests: XCTestCase {
         // Wire-contract: custom events get events[].name = "custom"
         // AND events[].payload.event_name = "<nome_original>"
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_button_click",
+            events: [EventInput(family: .custom, name: "my_button_click",
                       payload: ["button": AnyCodable("subscribe")],
                       timestamp: 1_715_000_000_006)],
             providerContext: nil
@@ -285,7 +359,7 @@ final class WireContractTests: XCTestCase {
         // $app_installed is NOT deprecated — treated as custom (family=custom),
         // with payload.event_name = "$app_installed"
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "$app_installed",
+            events: [EventInput(family: .custom, name: "$app_installed",
                       payload: ["platform": AnyCodable("ios"), "installedAt": AnyCodable(1_715_000_000_000.0)],
                       timestamp: 1_715_000_000_007)],
             providerContext: nil
@@ -299,7 +373,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_promotesDeviceModelFromPayload() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_event",
+            events: [EventInput(family: .custom, name: "my_event",
                       payload: ["deviceModel": AnyCodable("iPhone15,2"), "prop": AnyCodable("value")],
                       timestamp: 1_715_000_000_008)],
             providerContext: nil
@@ -315,7 +389,7 @@ final class WireContractTests: XCTestCase {
     func testEnvelopeV2_promotesOsVersionAlias() throws {
         // Wire-contract: systemVersion → os_version in context
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_event",
+            events: [EventInput(family: .custom, name: "my_event",
                       payload: ["systemVersion": AnyCodable("17.4")],
                       timestamp: 1_715_000_000_009)],
             providerContext: nil
@@ -331,7 +405,7 @@ final class WireContractTests: XCTestCase {
         ctx.distinctId = "provider_user"
 
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_event",
+            events: [EventInput(family: .custom, name: "my_event",
                       payload: ["distinct_id": AnyCodable("payload_user")],
                       timestamp: 1_715_000_000_010)],
             providerContext: ctx
@@ -343,7 +417,7 @@ final class WireContractTests: XCTestCase {
     func testEnvelopeV2_distinctIdFallbackFromFirstEvent() throws {
         // Wire-contract: if provider doesn't set distinct_id, falls back to events[0].payload.distinct_id
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_event",
+            events: [EventInput(family: .custom, name: "my_event",
                       payload: ["distinct_id": AnyCodable("fallback_user")],
                       timestamp: 1_715_000_000_011)],
             providerContext: nil
@@ -356,7 +430,7 @@ final class WireContractTests: XCTestCase {
     func testEnvelopeV2_idsSubObjectInContext() throws {
         // Wire-contract: ids dict in payload is hoisted to context.ids
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_event",
+            events: [EventInput(family: .custom, name: "my_event",
                       payload: ["ids": AnyCodable(["idfv": "idfv-001", "fb_anon_id": "anon-001"])],
                       timestamp: 1_715_000_000_012)],
             providerContext: nil
@@ -371,7 +445,7 @@ final class WireContractTests: XCTestCase {
     func testEnvelopeV2_attributionSubObjectInContext() throws {
         // Wire-contract: attribution dict in payload is hoisted to context.attribution
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .custom, name: "my_event",
+            events: [EventInput(family: .custom, name: "my_event",
                       payload: ["attribution": AnyCodable(["fbclid": "fb_test_123", "utm_source": "fb"])],
                       timestamp: 1_715_000_000_013)],
             providerContext: nil
@@ -387,7 +461,7 @@ final class WireContractTests: XCTestCase {
 
     func testEnvelopeV2_defaultsInjectedWhenContextIsNil() throws {
         let envelope = V2EnvelopeBuilder.build(
-            events: [(family: .lifecycle, name: "lifecycle", payload: [:], timestamp: 1_715_000_000_014)],
+            events: [EventInput(family: .lifecycle, name: "lifecycle", payload: [:], timestamp: 1_715_000_000_014)],
             providerContext: nil
         )
         // Wire-contract: sdk_version and platform default to SDK constants
@@ -558,51 +632,15 @@ final class WireContractTests: XCTestCase {
     }
 
     // MARK: - 9. Request: /sdk/attribution/deferred-match/{appKey} — body + path
+    //
+    // Now driven through InstallRetryScheduler.start: the old one-shot
+    // InstallTracker.performDeferredMatch stamped `deferred_match_done` regardless of the
+    // outcome, which sealed devices that had not matched yet.
 
-    func testDeferredMatchRequest_pathContainsAppKey() async throws {
-        MockURLProtocol.enqueueResponse(statusCode: 200)
-
-        let storage = makeIsolatedStorage()
-        let tracker = InstallTracker(storage: storage)
-        let httpClient = HttpClient(
-            baseUrl: "https://api.test.com",
-            timeout: 5,
-            retryConfig: RetryConfig(maxRetries: 0, baseDelay: 0, maxDelay: 0),
-            debug: false,
-            globalHeaders: [:],
-            session: session
-        )
-
-        await tracker.performDeferredMatch(
-            appKey: "pk_wire_test",
-            httpClient: httpClient,
-            deviceData: nil,
-            advertisingIds: nil
-        )
-
-        let req = MockURLProtocol.capturedRequests.first
-        XCTAssertNotNil(req, "Deferred match deve ter feito uma request HTTP")
-        XCTAssertTrue(req?.url?.path.contains("deferred-match/pk_wire_test") == true,
-                      "DESVIO: appKey deve estar no PATH /sdk/attribution/deferred-match/{appKey}")
-        XCTAssertEqual(req?.httpMethod, "POST")
-    }
-
-    func testDeferredMatchRequest_bodyHasRequiredFields() async throws {
-        MockURLProtocol.enqueueResponse(statusCode: 200)
-
-        let storage = makeIsolatedStorage()
-        let tracker = InstallTracker(storage: storage)
-        let httpClient = HttpClient(
-            baseUrl: "https://api.test.com",
-            timeout: 5,
-            retryConfig: RetryConfig(maxRetries: 0, baseDelay: 0, maxDelay: 0),
-            debug: false,
-            globalHeaders: [:],
-            session: session
-        )
-        let device = DeviceData(
+    private func makeDeferredMatchDevice() -> DeviceData {
+        DeviceData(
             deviceId: "idfv-deferred-001",
-            model: "iPhone",
+            model: "iPhone 15 Pro",
             modelId: "iPhone15,2",
             systemName: "iOS",
             systemVersion: "17.4",
@@ -622,20 +660,52 @@ final class WireContractTests: XCTestCase {
             language: "pt_BR",
             timezone: "America/Sao_Paulo"
         )
-        let ads = AdvertisingIdResult(idfv: "idfv-deferred-001", idfa: nil, attStatus: .undetermined)
+    }
 
-        await tracker.performDeferredMatch(
-            appKey: "pk_wire_test",
-            httpClient: httpClient,
-            deviceData: device,
-            advertisingIds: ads,
-            fbAnonymousId: "fb_anon_deferred"
+    private func runDeferredMatch(storage: SecureStorage) async -> ApiClient {
+        let client = makeApiClient()
+        let scheduler = InstallRetryScheduler(
+            debug: false,
+            storage: storage,
+            attributionTracker: AttributionTracker(storage: storage),
+            deepLinkStore: DeferredDeepLinkStore(storage: storage)
         )
+        await scheduler.start(
+            apiClient: client,
+            distinctId: "user_wire_009",
+            deviceData: makeDeferredMatchDevice(),
+            country: "BR",
+            idfv: "idfv-deferred-001",
+            anonId: "fb_anon_deferred",
+            installedAt: 1_735_689_600_000,
+            rawReferrer: nil
+        )
+        return client
+    }
+
+    func testDeferredMatchRequest_pathContainsAppKey() async throws {
+        MockURLProtocol.enqueueResponse(statusCode: 200)
+        let storage = makeIsolatedStorage()
+
+        _ = await runDeferredMatch(storage: storage)
+
+        let req = MockURLProtocol.capturedRequests.first
+        XCTAssertEqual(req?.httpMethod, "POST")
+        XCTAssertTrue(
+            req?.url?.path.hasSuffix("/sdk/attribution/deferred-match/pk_test_wire") == true,
+            "DESVIO: deferred-match deve ir para /sdk/attribution/deferred-match/{appKey}, recebido: \(req?.url?.path ?? "nil")"
+        )
+    }
+
+    func testDeferredMatchRequest_bodyHasRequiredFields() async throws {
+        MockURLProtocol.enqueueResponse(statusCode: 200)
+        let storage = makeIsolatedStorage()
+
+        _ = await runDeferredMatch(storage: storage)
 
         let req = MockURLProtocol.capturedRequests.first
         let body = try bodyJSON(req!)
 
-        // Wire-contract deferred-match body fields
         XCTAssertEqual(body["platform"] as? String, "ios",
                        "DESVIO: deferred-match body.platform deve ser 'ios'")
         XCTAssertNotNil(body["installTimestamp"],
@@ -650,15 +720,12 @@ final class WireContractTests: XCTestCase {
         XCTAssertEqual(body["screenHeight"] as? Int, 844)
         XCTAssertEqual(body["idfv"] as? String, "idfv-deferred-001")
         XCTAssertEqual(body["fbAnonId"] as? String, "fb_anon_deferred")
-
-        // Wire-contract: deferred-match DOES NOT carry global headers (fetch cru)
-        // Verificamos que x-sdk-version/x-sdk-platform/x-sdk-environment NÃO estão presentes
-        XCTAssertNil(req?.value(forHTTPHeaderField: "x-sdk-version"),
-                     "DESVIO: deferred-match não deve enviar x-sdk-version (sem headers globais)")
-        XCTAssertNil(req?.value(forHTTPHeaderField: "x-sdk-platform"),
-                     "DESVIO: deferred-match não deve enviar x-sdk-platform (sem headers globais)")
-        XCTAssertNil(req?.value(forHTTPHeaderField: "x-sdk-environment"),
-                     "DESVIO: deferred-match não deve enviar x-sdk-environment (sem headers globais)")
+        XCTAssertEqual(body["country"] as? String, "BR",
+                       "DESVIO: country vem do regionCode, não de um split do locale")
+        // Sem distinctId o servidor grava install_attributions.distinct_id vazio e o join
+        // com app_users.external_id nunca casa (fix da 2.6.2).
+        XCTAssertEqual(body["distinctId"] as? String, "user_wire_009",
+                       "DESVIO: deferred-match DEVE enviar distinctId — é a chave de join do servidor")
     }
 
     // MARK: - 10. Request: /sdk/push-tokens — body shape
@@ -760,9 +827,9 @@ final class WireContractTests: XCTestCase {
     }
 
     func testConstants_sdkVersion() {
-        // Wire-contract: version 2.6.0
-        XCTAssertEqual(PaywalloConstants.sdkVersion, "2.6.0",
-                       "DESVIO: sdkVersion diverge do wire-contract (esperado 2.6.0)")
+        // Wire-contract: version 2.9.0 — paridade com o SDK React Native pós-incidente 03/08.
+        XCTAssertEqual(PaywalloConstants.sdkVersion, "2.9.0",
+                       "DESVIO: sdkVersion diverge do wire-contract (esperado 2.9.0)")
     }
 
     func testConstants_sdkPlatform() {

@@ -154,16 +154,33 @@ final class EventFamiliesTests: XCTestCase {
     func testValidateEvent_paywall_validType_returnsOk() {
         let (ok, family) = EventFamilies.validateEvent(
             eventName: "paywall",
-            properties: ["type": "viewed"]
+            properties: ["type": "viewed", "paywall_id": "pw_1"]
         )
         XCTAssertTrue(ok)
         XCTAssertEqual(family, .paywall)
     }
 
+    func testValidateEvent_paywall_missingPaywallId_returnsNotOk() {
+        let (ok, family) = EventFamilies.validateEvent(
+            eventName: "paywall",
+            properties: ["type": "viewed"]
+        )
+        XCTAssertFalse(ok, "paywall sem paywall_id deve reprovar")
+        XCTAssertEqual(family, .paywall)
+    }
+
+    func testValidateEvent_paywall_emptyPaywallId_returnsNotOk() {
+        let (ok, _) = EventFamilies.validateEvent(
+            eventName: "paywall",
+            properties: ["type": "viewed", "paywall_id": ""]
+        )
+        XCTAssertFalse(ok, "paywall_id vazio conta como ausente")
+    }
+
     func testValidateEvent_paywall_invalidType_returnsNotOk() {
         let (ok, _) = EventFamilies.validateEvent(
             eventName: "paywall",
-            properties: ["type": "unknown_action"]
+            properties: ["type": "unknown_action", "paywall_id": "pw_1"]
         )
         XCTAssertFalse(ok)
     }
@@ -171,15 +188,31 @@ final class EventFamiliesTests: XCTestCase {
     func testValidateEvent_transaction_validType_returnsOk() {
         let (ok, _) = EventFamilies.validateEvent(
             eventName: "transaction",
-            properties: ["type": "completed"]
+            properties: ["type": "completed", "transaction_id": "tx_1"]
         )
         XCTAssertTrue(ok)
+    }
+
+    func testValidateEvent_transaction_missingTransactionId_returnsNotOk() {
+        let (ok, _) = EventFamilies.validateEvent(
+            eventName: "transaction",
+            properties: ["type": "completed"]
+        )
+        XCTAssertFalse(ok, "transaction sem transaction_id nem tx_id deve reprovar")
+    }
+
+    func testValidateEvent_transaction_legacyTxIdAccepted() {
+        let (ok, _) = EventFamilies.validateEvent(
+            eventName: "transaction",
+            properties: ["type": "completed", "tx_id": "tx_legacy"]
+        )
+        XCTAssertTrue(ok, "tx_id legado ainda satisfaz o requisito de id")
     }
 
     func testValidateEvent_transaction_invalidType_returnsNotOk() {
         let (ok, _) = EventFamilies.validateEvent(
             eventName: "transaction",
-            properties: ["type": "zap"]
+            properties: ["type": "zap", "transaction_id": "tx_1"]
         )
         XCTAssertFalse(ok)
     }
@@ -187,7 +220,7 @@ final class EventFamiliesTests: XCTestCase {
     func testValidateEvent_transaction_invalidCurrencyLength_returnsNotOk() {
         let (ok, _) = EventFamilies.validateEvent(
             eventName: "transaction",
-            properties: ["currency": "US"]  // must be 3 chars
+            properties: ["currency": "US", "transaction_id": "tx_1"]  // must be 3 chars
         )
         XCTAssertFalse(ok)
     }
@@ -195,7 +228,7 @@ final class EventFamiliesTests: XCTestCase {
     func testValidateEvent_transaction_validCurrencyLength_returnsOk() {
         let (ok, _) = EventFamilies.validateEvent(
             eventName: "transaction",
-            properties: ["currency": "USD"]
+            properties: ["currency": "USD", "transaction_id": "tx_1"]
         )
         XCTAssertTrue(ok)
     }
@@ -220,13 +253,30 @@ final class EventFamiliesTests: XCTestCase {
         XCTAssertEqual(family, .custom)
     }
 
-    func testValidateEvent_identify_alwaysOk() {
+    func testValidateEvent_identify_withDistinctId_returnsOk() {
+        let (ok, family) = EventFamilies.validateEvent(
+            eventName: "identify",
+            properties: ["distinct_id": "abc123"]
+        )
+        XCTAssertTrue(ok)
+        XCTAssertEqual(family, .identify)
+    }
+
+    func testValidateEvent_identify_missingDistinctId_returnsNotOk() {
         let (ok, family) = EventFamilies.validateEvent(
             eventName: "identify",
             properties: ["user_id": "abc123"]
         )
-        XCTAssertTrue(ok)
+        XCTAssertFalse(ok, "identify sem distinct_id deve reprovar")
         XCTAssertEqual(family, .identify)
+    }
+
+    func testValidateEvent_identify_emptyDistinctId_returnsNotOk() {
+        let (ok, _) = EventFamilies.validateEvent(
+            eventName: "identify",
+            properties: ["distinct_id": ""]
+        )
+        XCTAssertFalse(ok, "distinct_id vazio conta como ausente")
     }
 
     func testValidateEvent_notification_validType_returnsOk() {
@@ -237,16 +287,22 @@ final class EventFamiliesTests: XCTestCase {
     }
 
     func testValidateEvent_onboarding_validType_returnsOk() {
-        for type_ in ["step", "complete", "drop"] {
+        for type_ in ["step", "complete"] {
             let (ok, _) = EventFamilies.validateEvent(eventName: "onboarding", properties: ["type": type_])
             XCTAssertTrue(ok, "Expected onboarding type '\(type_)' to be valid")
         }
     }
 
+    func testValidateEvent_onboarding_dropTypeRemoved_returnsNotOk() {
+        // `drop` saiu da taxonomia V2 — o servidor rejeita.
+        let (ok, _) = EventFamilies.validateEvent(eventName: "onboarding", properties: ["type": "drop"])
+        XCTAssertFalse(ok, "onboarding type 'drop' foi removido da taxonomia")
+    }
+
     func testValidateEvent_paywall_viewedType_returnsOk() {
         let (ok, family) = EventFamilies.validateEvent(
             eventName: "paywall",
-            properties: ["type": "viewed"]
+            properties: ["type": "viewed", "paywall_id": "pw_1"]
         )
         XCTAssertTrue(ok)
         XCTAssertEqual(family, .paywall)
@@ -255,7 +311,7 @@ final class EventFamiliesTests: XCTestCase {
     func testValidateEvent_transaction_trialStarted_returnsOk() {
         let (ok, family) = EventFamilies.validateEvent(
             eventName: "transaction",
-            properties: ["type": "trial_started"]
+            properties: ["type": "trial_started", "transaction_id": "tx_1"]
         )
         XCTAssertTrue(ok)
         XCTAssertEqual(family, .transaction)
@@ -277,9 +333,10 @@ final class V2EnvelopeBuilderTests: XCTestCase {
         family: EventFamily = .custom,
         name: String = "test_event",
         payload: [String: AnyCodable] = [:],
-        timestamp: TimeInterval = 1_000_000
-    ) -> (family: EventFamily, name: String, payload: [String: AnyCodable], timestamp: TimeInterval) {
-        (family: family, name: name, payload: payload, timestamp: timestamp)
+        timestamp: TimeInterval = 1_000_000,
+        distinctId: String = ""
+    ) -> EventInput {
+        EventInput(family: family, name: name, payload: payload, timestamp: timestamp, distinctId: distinctId)
     }
 
     // MARK: Baseline context fields
@@ -442,6 +499,149 @@ final class V2EnvelopeBuilderTests: XCTestCase {
         let envelope = V2EnvelopeBuilder.build(events: [event1, event2])
         XCTAssertEqual(envelope.context.distinctId, "first_user")
     }
+
+    // MARK: Novos slots de context (2.9.0)
+
+    func testBuild_appBuildAndBundleIdPromotedFromPayload() {
+        let event = makeEvent(payload: [
+            "app_build": AnyCodable("4211"),
+            "bundle_id": AnyCodable("com.acme.app"),
+        ])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.context.appBuild, "4211")
+        XCTAssertEqual(envelope.context.bundleId, "com.acme.app")
+        XCTAssertNil(envelope.events[0].payload["app_build"])
+        XCTAssertNil(envelope.events[0].payload["bundle_id"])
+    }
+
+    func testBuild_carrierPromotedFromPayload() {
+        let envelope = V2EnvelopeBuilder.build(events: [makeEvent(payload: ["carrier": AnyCodable("Vivo")])])
+        XCTAssertEqual(envelope.context.carrier, "Vivo")
+    }
+
+    func testBuild_screenMetricsAreNumericInContext() {
+        let event = makeEvent(payload: [
+            "screen_width": AnyCodable(390),
+            "screen_height": AnyCodable(844.0),
+            "screen_density": AnyCodable(3.0),
+        ])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.context.screenWidth, 390)
+        XCTAssertEqual(envelope.context.screenHeight, 844)
+        XCTAssertEqual(envelope.context.screenDensity, 3)
+    }
+
+    func testBuild_camelCaseScreenKeysStayInPayload() {
+        // Promover screenWidth/screenHeight deletaria as chaves que o server lê do
+        // payload do $app_installed — por isso NÃO existe alias camelCase.
+        let event = makeEvent(payload: [
+            "screenWidth": AnyCodable(390),
+            "screenHeight": AnyCodable(844),
+        ])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertNotNil(envelope.events[0].payload["screenWidth"])
+        XCTAssertNotNil(envelope.events[0].payload["screenHeight"])
+        XCTAssertNil(envelope.context.screenWidth)
+    }
+
+    func testBuild_countryIsCopiedNotMoved() {
+        let event = makeEvent(payload: ["country": AnyCodable("MX")])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.context.country, "MX")
+        XCTAssertEqual(envelope.events[0].payload["country"]?.value as? String, "MX",
+                       "country precisa ficar no payload: é o trait explícito do identify()")
+    }
+
+    func testBuild_regionCodeAliasFeedsCountry() {
+        let envelope = V2EnvelopeBuilder.build(events: [makeEvent(payload: ["regionCode": AnyCodable("BR")])])
+        XCTAssertEqual(envelope.context.country, "BR")
+    }
+
+    // MARK: installEventId / installClassification
+
+    func testBuild_validUUIDv4InstallEventIdBecomesEventId() {
+        let installId = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
+        let event = makeEvent(payload: ["installEventId": AnyCodable(installId)])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.events[0].id, installId, "o dedup de install no servidor depende desse id")
+        XCTAssertNil(envelope.events[0].payload["installEventId"])
+    }
+
+    func testBuild_invalidInstallEventIdFallsBackToNewUUID() {
+        let event = makeEvent(payload: ["installEventId": AnyCodable("not-a-uuid")])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertNotEqual(envelope.events[0].id, "not-a-uuid")
+        XCTAssertFalse(envelope.events[0].id.isEmpty)
+    }
+
+    func testBuild_uuidV1IsRejectedAsInstallEventId() {
+        // Versão 1 (dígito 1 no 3º grupo) não é v4 — o servidor só dedupa v4.
+        let event = makeEvent(payload: ["installEventId": AnyCodable("3f2504e0-4f89-11d3-9a0c-0305e82c3301")])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertNotEqual(envelope.events[0].id, "3f2504e0-4f89-11d3-9a0c-0305e82c3301")
+    }
+
+    func testBuild_installClassificationBecomesEventSibling() throws {
+        let event = makeEvent(payload: ["installClassification": AnyCodable("paid")])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.events[0].installClassification, "paid")
+        XCTAssertNil(envelope.events[0].payload["installClassification"])
+
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(envelope)) as? [String: Any]
+        let firstEvent = (json?["events"] as? [[String: Any]])?.first
+        XCTAssertEqual(firstEvent?["installClassification"] as? String, "paid",
+                       "installClassification é irmão de payload, não filho")
+    }
+
+    func testBuild_emptyInstallClassificationIsIgnored() {
+        let envelope = V2EnvelopeBuilder.build(events: [makeEvent(payload: ["installClassification": AnyCodable("")])])
+        XCTAssertNil(envelope.events[0].installClassification)
+    }
+
+    func testBuild_noInstallClassificationKeyOmittedFromJSON() throws {
+        let envelope = V2EnvelopeBuilder.build(events: [makeEvent()])
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(envelope)) as? [String: Any]
+        let firstEvent = (json?["events"] as? [[String: Any]])?.first
+        XCTAssertNil(firstEvent?["installClassification"])
+    }
+
+    // MARK: context.ids espelhado do payload (copy, não move)
+
+    func testBuild_idsMirroredFromPayloadButKept() {
+        let event = makeEvent(payload: [
+            "idfv": AnyCodable("IDFV-1"),
+            "idfa": AnyCodable("IDFA-1"),
+            "fbAnonId": AnyCodable("fb-anon-1"),
+        ])
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.context.ids?["idfv"]?.value as? String, "IDFV-1")
+        XCTAssertEqual(envelope.context.ids?["idfa"]?.value as? String, "IDFA-1")
+        XCTAssertEqual(envelope.context.ids?["fb_anon_id"]?.value as? String, "fb-anon-1")
+        XCTAssertEqual(envelope.events[0].payload["idfv"]?.value as? String, "IDFV-1",
+                       "ids são copiados, não movidos — o parser antigo lê do payload")
+    }
+
+    func testBuild_providerIdsWinOverPayloadIds() {
+        var ctx = IngestContext()
+        ctx.ids = ["idfv": AnyCodable("PROVIDER")]
+        let event = makeEvent(payload: ["idfv": AnyCodable("PAYLOAD")])
+        let envelope = V2EnvelopeBuilder.build(events: [event], providerContext: ctx)
+        XCTAssertEqual(envelope.context.ids?["idfv"]?.value as? String, "PROVIDER")
+    }
+
+    // MARK: distinct_id do EventInput
+
+    func testBuild_eventInputDistinctIdUsedWhenPayloadHasNone() {
+        let event = makeEvent(payload: [:], distinctId: "from_input")
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.context.distinctId, "from_input")
+    }
+
+    func testBuild_payloadDistinctIdWinsOverEventInput() {
+        let event = makeEvent(payload: ["distinct_id": AnyCodable("from_payload")], distinctId: "from_input")
+        let envelope = V2EnvelopeBuilder.build(events: [event])
+        XCTAssertEqual(envelope.context.distinctId, "from_payload")
+    }
 }
 
 // MARK: - EventPipelineBridge Tests
@@ -534,267 +734,5 @@ final class EventPipelineBridgeTests: XCTestCase {
         XCTAssertEqual(result?["age"]?.value as? Int, 30)
         XCTAssertEqual(result?["score"]?.value as? Double, 9.5)
         XCTAssertEqual(result?["active"]?.value as? Bool, true)
-    }
-}
-
-// MARK: - OfflineQueue Tests
-
-final class OfflineQueueTests: XCTestCase {
-
-    private var queue: OfflineQueue!
-    private var storage: NativeStorage!
-    private var suite: UserDefaults!
-    private var suiteName: String!
-
-    override func setUp() {
-        super.setUp()
-        let id = UUID().uuidString
-        suiteName = "com.paywallo.sdk.tests.queue.\(id)"
-        suite = UserDefaults(suiteName: suiteName)!
-        storage = NativeStorage(service: "com.paywallo.sdk.tests.\(id)", defaults: suite)
-
-        // Use very small maxAttempts (3) so tests don't have to iterate 10 times
-        queue = OfflineQueue(
-            storage: storage,
-            maxCapacity: 1000,
-            maxAttempts: 3,
-            maxAge: 7 * 24 * 3600,
-            baseRetryDelay: 0.001,
-            maxRetryDelay: 0.001
-        )
-    }
-
-    override func tearDown() {
-        queue.dispose()
-        UserDefaults.standard.removePersistentDomain(forName: suiteName)
-        super.tearDown()
-    }
-
-    // MARK: Helpers
-
-    private func makeItem(
-        id: String = UUID().uuidString,
-        priority: QueueItemPriority = .normal,
-        appKey: String = "pk_test",
-        attempts: Int = 0,
-        nextRetryAt: Date? = nil
-    ) -> QueueItem {
-        QueueItem(
-            id: id,
-            method: "POST",
-            url: "/sdk/ingest/batch",
-            payload: nil,
-            headers: [:],
-            priority: priority,
-            appKey: appKey,
-            createdAt: Date(),
-            attempts: attempts,
-            nextRetryAt: nextRetryAt,
-            isEvent: true
-        )
-    }
-
-    // MARK: Basic enqueue + dequeueReady
-
-    func testEnqueueAndDequeueReady_returnsItem() {
-        let item = makeItem()
-        queue.enqueue(item)
-        let ready = queue.dequeueReady()
-        XCTAssertEqual(ready.count, 1)
-        XCTAssertEqual(ready[0].id, item.id)
-    }
-
-    func testDequeueReady_emptyQueue_returnsEmpty() {
-        XCTAssertTrue(queue.dequeueReady().isEmpty)
-    }
-
-    // MARK: Dedup
-
-    func testDedup_sameId_doesNotDuplicate() {
-        let id = UUID().uuidString
-        queue.enqueue(makeItem(id: id))
-        queue.enqueue(makeItem(id: id))
-        XCTAssertEqual(queue.count, 1)
-    }
-
-    func testDedup_differentIds_bothEnqueued() {
-        queue.enqueue(makeItem(id: "id_1"))
-        queue.enqueue(makeItem(id: "id_2"))
-        XCTAssertEqual(queue.count, 2)
-    }
-
-    // MARK: Priority upgrade
-
-    func testPriorityUpgrade_normalToCritical() {
-        let id = UUID().uuidString
-        queue.enqueue(makeItem(id: id, priority: .normal))
-        queue.enqueue(makeItem(id: id, priority: .critical))
-
-        let items = queue.getAll()
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(items[0].priority, .critical, "Item priority must be upgraded to critical")
-    }
-
-    func testPriorityUpgrade_criticalToNormal_staysCritical() {
-        let id = UUID().uuidString
-        queue.enqueue(makeItem(id: id, priority: .critical))
-        queue.enqueue(makeItem(id: id, priority: .normal))
-
-        let items = queue.getAll()
-        XCTAssertEqual(items[0].priority, .critical, "Critical priority must not be downgraded")
-    }
-
-    // MARK: markSuccess
-
-    func testMarkSuccess_removesItem() {
-        let item = makeItem()
-        queue.enqueue(item)
-        queue.markSuccess(item.id)
-        XCTAssertEqual(queue.count, 0)
-    }
-
-    func testMarkSuccess_nonExistentId_doesNotCrash() {
-        queue.markSuccess("nonexistent_id")  // must not throw/crash
-        XCTAssertEqual(queue.count, 0)
-    }
-
-    // MARK: markFailure
-
-    func testMarkFailure_incrementsAttempts() {
-        let item = makeItem()
-        queue.enqueue(item)
-        queue.markFailure(item.id)
-
-        let items = queue.getAll()
-        XCTAssertEqual(items.count, 1)
-        XCTAssertEqual(items[0].attempts, 1)
-    }
-
-    func testMarkFailure_setsNextRetryAt() {
-        let item = makeItem()
-        queue.enqueue(item)
-        queue.markFailure(item.id)
-
-        let items = queue.getAll()
-        XCTAssertNotNil(items[0].nextRetryAt, "nextRetryAt must be set after failure")
-    }
-
-    func testMarkFailure_itemWithFutureRetry_notReturnedByDequeueReady() {
-        // Create item with a very future nextRetryAt
-        let futureRetry = Date().addingTimeInterval(3600)
-        let item = makeItem(nextRetryAt: futureRetry)
-        queue.enqueue(item)
-
-        let ready = queue.dequeueReady()
-        XCTAssertTrue(ready.isEmpty, "Item with future retry should not be returned")
-    }
-
-    // MARK: maxAttempts → removed from main queue
-
-    func testMaxAttempts_itemRemovedFromMainQueue() {
-        let item = makeItem()
-        queue.enqueue(item)
-
-        // Fail it maxAttempts (3) times
-        for _ in 0..<3 {
-            queue.markFailure(item.id)
-        }
-
-        // Item must be removed from main queue (moved to DLQ)
-        XCTAssertEqual(queue.count, 0,
-                       "Item must be removed from main queue after maxAttempts failures")
-    }
-
-    // MARK: clearItemsWithInvalidAppKey
-
-    func testClearItemsWithInvalidAppKey_removesWrongKey() {
-        queue.enqueue(makeItem(id: "a", appKey: "pk_correct"))
-        queue.enqueue(makeItem(id: "b", appKey: "pk_wrong"))
-        queue.clearItemsWithInvalidAppKey("pk_correct")
-        XCTAssertEqual(queue.count, 1)
-        XCTAssertEqual(queue.getAll()[0].id, "a")
-    }
-
-    func testClearItemsWithInvalidAppKey_keepsAllIfAllMatch() {
-        queue.enqueue(makeItem(id: "a", appKey: "pk_test"))
-        queue.enqueue(makeItem(id: "b", appKey: "pk_test"))
-        queue.clearItemsWithInvalidAppKey("pk_test")
-        XCTAssertEqual(queue.count, 2)
-    }
-
-    func testClearItemsWithInvalidAppKey_removesAllIfNoneMatch() {
-        queue.enqueue(makeItem(id: "a", appKey: "pk_old"))
-        queue.enqueue(makeItem(id: "b", appKey: "pk_old"))
-        queue.clearItemsWithInvalidAppKey("pk_new")
-        XCTAssertEqual(queue.count, 0)
-    }
-
-    // MARK: clear
-
-    func testClear_removesEverything() {
-        queue.enqueue(makeItem(id: "a"))
-        queue.enqueue(makeItem(id: "b"))
-        queue.clear()
-        XCTAssertEqual(queue.count, 0)
-        XCTAssertTrue(queue.isEmpty)
-    }
-
-    // MARK: count and isEmpty
-
-    func testCount_emptyQueue_isZero() {
-        XCTAssertEqual(queue.count, 0)
-    }
-
-    func testIsEmpty_emptyQueue_isTrue() {
-        XCTAssertTrue(queue.isEmpty)
-    }
-
-    func testCount_afterEnqueue_isCorrect() {
-        queue.enqueue(makeItem(id: "a"))
-        queue.enqueue(makeItem(id: "b"))
-        XCTAssertEqual(queue.count, 2)
-        XCTAssertFalse(queue.isEmpty)
-    }
-
-    func testCount_afterMarkSuccess_decrements() {
-        let item = makeItem()
-        queue.enqueue(item)
-        XCTAssertEqual(queue.count, 1)
-        queue.markSuccess(item.id)
-        XCTAssertEqual(queue.count, 0)
-    }
-
-    // MARK: onFlushRequested callback
-
-    func testOnFlushRequested_calledForCriticalItem() {
-        let expectation = self.expectation(description: "onFlushRequested called")
-        queue.onFlushRequested = {
-            expectation.fulfill()
-        }
-        queue.enqueue(makeItem(priority: .critical))
-        waitForExpectations(timeout: 1.0)
-    }
-
-    func testOnFlushRequested_notCalledForNormalItem() {
-        var called = false
-        queue.onFlushRequested = { called = true }
-        queue.enqueue(makeItem(priority: .normal))
-        // Give brief time for any async callback
-        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
-        XCTAssertFalse(called, "onFlushRequested must not be called for normal priority items")
-    }
-
-    // MARK: dequeueReady — attempts filter
-
-    func testDequeueReady_itemAtMaxAttempts_notReturned() {
-        // We test via marking failure 3 times on an enqueued item
-        let freshItem = makeItem()
-        queue.enqueue(freshItem)
-        queue.markFailure(freshItem.id)
-        queue.markFailure(freshItem.id)
-        queue.markFailure(freshItem.id)
-        // After 3 failures with maxAttempts=3, item moves to DLQ
-        XCTAssertEqual(queue.count, 0)
-        XCTAssertTrue(queue.dequeueReady().isEmpty)
     }
 }

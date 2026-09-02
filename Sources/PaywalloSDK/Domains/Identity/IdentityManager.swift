@@ -9,6 +9,11 @@ public struct IdentityState {
     public let lastName: String?
     public let dateOfBirth: String?
     public let gender: String?
+    public let zipCode: String?
+    /// True when the IDFV read this session differs from the last persisted one — the
+    /// device key changed under us, which breaks the stitch and shows up in
+    /// `installSignals.idfvChanged`.
+    public let idfvChanged: Bool
 }
 
 public final class IdentityManager {
@@ -21,6 +26,9 @@ public final class IdentityManager {
     private var lastName: String?
     private var dateOfBirth: String?
     private var gender: String?
+    private var zipCode: String?
+    private var previousIdfv: String?
+    private var idfvChanged = false
     private var distinctId: String?
 
     private var secureStorage: SecureStorage
@@ -67,15 +75,8 @@ public final class IdentityManager {
         await loadPersistedState()
 
         // 3. Ensure deviceId
+        let deviceData = await MainActor.run { DeviceInfo.shared.getDeviceInfo() }
         if deviceId == nil {
-            let info = DeviceInfo.shared
-            let deviceData: DeviceData
-            #if canImport(UIKit)
-            deviceData = await MainActor.run { info.getDeviceInfo() }
-            #else
-            deviceData = await MainActor.run { info.getDeviceInfo() }
-            #endif
-
             let id = deviceData.deviceId
             deviceId = (id == "unknown" || id.isEmpty) ? UUID().uuidString : id
 
@@ -85,14 +86,35 @@ public final class IdentityManager {
             }
         }
 
-        // 4. Ensure anonId
+        // 4. IDFV drift detection — runs on every boot, not only the first.
+        await detectIdfvChange(deviceData)
+
+        // 5. Ensure anonId
         if anonId == nil {
-            anonId = UUID().uuidString
-            await secureStorage.set(PaywalloConstants.anonIdKey, value: anonId!)
+            let newAnonId = UUID().uuidString
+            anonId = newAnonId
+            // Durable write: retries plus a regular-storage fallback (anti-inflation).
+            await IdentityStorage.persistAnonIdDurably(storage: secureStorage, anonId: newAnonId)
         }
 
         initialized = true
         return deviceId ?? ""
+    }
+
+    /// The IDFV is the device's #1 key; a silent swap (restore to a new device, all the
+    /// vendor's apps uninstalled) breaks the stitch. Detect it, record the new value, and
+    /// let the install payload carry the fact.
+    private func detectIdfvChange(_ deviceData: DeviceData) async {
+        let idfv = deviceData.idfv
+        guard !idfv.isEmpty, idfv != "unknown" else { return }
+
+        let stored = await secureStorage.get(PaywalloConstants.previousIdfvKey)
+        idfvChanged = stored != nil && stored != idfv
+        previousIdfv = idfv
+
+        if stored != idfv {
+            await secureStorage.set(PaywalloConstants.previousIdfvKey, value: idfv)
+        }
     }
 
     // MARK: - Identify
@@ -140,6 +162,23 @@ public final class IdentityManager {
             self.gender = gender.rawValue
             await secureStorage.set(PaywalloConstants.userGenderKey, value: gender.rawValue)
         }
+        if let zipCode = options.zipCode {
+            self.zipCode = zipCode
+            await secureStorage.set(PaywalloConstants.userZipKey, value: zipCode)
+        }
+    }
+
+    /// Merges properties into the persisted set. Unlike `identify`, it never touches PII.
+    public func updateProperties(_ properties: [String: AnyCodable]) async {
+        guard initialized else { return }
+
+        for (key, value) in properties {
+            self.properties[key] = value
+        }
+        if let jsonData = try? JSONEncoder().encode(self.properties),
+           let json = String(data: jsonData, encoding: .utf8) {
+            await secureStorage.set(PaywalloConstants.userPropertiesKey, value: json)
+        }
     }
 
     // MARK: - Reset
@@ -156,6 +195,7 @@ public final class IdentityManager {
         lastName = nil
         dateOfBirth = nil
         gender = nil
+        zipCode = nil
 
         await secureStorage.set(PaywalloConstants.anonIdKey, value: newAnonId)
         await secureStorage.remove(PaywalloConstants.userEmailKey)
@@ -165,6 +205,51 @@ public final class IdentityManager {
         await secureStorage.remove(PaywalloConstants.userLastNameKey)
         await secureStorage.remove(PaywalloConstants.userDobKey)
         await secureStorage.remove(PaywalloConstants.userGenderKey)
+        await secureStorage.remove(PaywalloConstants.userZipKey)
+    }
+
+    /// DEV only: erases the install markers and issues a new anonId, so the next cold
+    /// start is a genuinely new user. Needed because those keys live in the Keychain and
+    /// survive uninstalling the app — without this there is no way to test acquisition on
+    /// a device that already ran it. Neither `reset()` nor `fullReset()` touch them.
+    public func clearInstallStateForDev() async {
+        await InstallIdempotency.clearInstallState(storage: secureStorage)
+        await reset()
+    }
+
+    /// LGPD/GDPR erase: wipes local PII plus distinctId and clears pending critical
+    /// retries (their bodies may carry PII).
+    ///
+    /// Does NOT touch deviceId or SDK config — those are not user data, and deviceId
+    /// feeds install idempotency. A fresh anonId is issued IMMEDIATELY so a still-running
+    /// app never tracks under an empty distinctId.
+    public func deleteUserData() async {
+        guard initialized else { return }
+
+        await PendingRetry.shared.clear()
+
+        let newAnonId = UUID().uuidString
+        anonId = newAnonId
+        distinctId = nil
+        email = nil
+        properties = [:]
+        phone = nil
+        firstName = nil
+        lastName = nil
+        dateOfBirth = nil
+        gender = nil
+        zipCode = nil
+
+        await IdentityStorage.persistAnonIdDurably(storage: secureStorage, anonId: newAnonId)
+        await secureStorage.remove(PaywalloConstants.distinctIdKey)
+        await secureStorage.remove(PaywalloConstants.userEmailKey)
+        await secureStorage.remove(PaywalloConstants.userPropertiesKey)
+        await secureStorage.remove(PaywalloConstants.userPhoneKey)
+        await secureStorage.remove(PaywalloConstants.userFirstNameKey)
+        await secureStorage.remove(PaywalloConstants.userLastNameKey)
+        await secureStorage.remove(PaywalloConstants.userDobKey)
+        await secureStorage.remove(PaywalloConstants.userGenderKey)
+        await secureStorage.remove(PaywalloConstants.userZipKey)
     }
 
     // MARK: - Getters
@@ -181,6 +266,11 @@ public final class IdentityManager {
 
     public func getProperties() -> [String: AnyCodable] { properties }
 
+    /// True when the IDFV read this session differs from the last persisted one.
+    public func hasIdfvChanged() -> Bool { idfvChanged }
+
+    public func getPreviousIdfv() -> String? { previousIdfv }
+
     public func getState() -> IdentityState {
         IdentityState(
             deviceId: deviceId ?? "",
@@ -190,7 +280,9 @@ public final class IdentityManager {
             firstName: firstName,
             lastName: lastName,
             dateOfBirth: dateOfBirth,
-            gender: gender
+            gender: gender,
+            zipCode: zipCode,
+            idfvChanged: idfvChanged
         )
     }
 
@@ -207,7 +299,9 @@ public final class IdentityManager {
 
         if let id = resolvedDeviceId { self.deviceId = id }
 
-        if let anonId = state.anonId {
+        // readAnonIdDurably checks the Keychain and then the regular-storage fallback, so
+        // a persisted anonId is never missed just because the Keychain was locked at boot.
+        if let anonId = await IdentityStorage.readAnonIdDurably(storage: secureStorage) {
             let legacyPrefix = "$paywallo_anon:"
             if anonId.hasPrefix(legacyPrefix) {
                 let stripped = String(anonId.dropFirst(legacyPrefix.count))
@@ -254,6 +348,10 @@ public final class IdentityManager {
             newKey: PaywalloConstants.userGenderKey,
             legacyKey: PaywalloConstants.legacyUserGenderKey
         ) { self.gender = gender }
+
+        if let zipCode = await secureStorage.get(PaywalloConstants.userZipKey) {
+            self.zipCode = zipCode
+        }
     }
 
     private func isValidEmail(_ email: String) -> Bool {

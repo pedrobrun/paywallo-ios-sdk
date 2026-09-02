@@ -1,24 +1,56 @@
 import XCTest
 @testable import PaywalloSDK
 
-// MARK: - InstallTrackerTests
+/// Answers every deferred-match POST with a plain 200 so the fire-and-forget scheduler
+/// started by `trackIfNeeded` never touches the network.
+private final class InstallStubProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: [:]
+        )!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"data":{"matched":false}}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
 
 final class InstallTrackerTests: XCTestCase {
 
     private var storage: SecureStorage!
+    private var native: NativeStorage!
     private var suiteName: String!
     private var tracker: InstallTracker!
+    private var attributionTracker: AttributionTracker!
+    private var apiClient: ApiClient!
 
-    // Tracks every `trackEvent` call
     private var trackedEvents: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
 
-    override func setUp() async throws {
-        try await super.setUp()
+    override func setUp() {
+        super.setUp()
         trackedEvents = []
-        let (s, _, suite) = makeIsolatedStorage()
-        storage = s
+        // The install guard is process-wide by design; every case starts from a cold launch.
+        InstallIdempotency.resetInstallGuardForTests()
+
+        let suite = "com.paywallo.sdk.install.tests.\(UUID().uuidString)"
         suiteName = suite
-        tracker = InstallTracker(storage: s)
+        native = NativeStorage(service: suite, defaults: UserDefaults(suiteName: suite)!)
+        storage = SecureStorage(nativeStorage: native)
+        attributionTracker = AttributionTracker(storage: storage, nativeStorage: native)
+        tracker = InstallTracker(
+            storage: storage,
+            attributionTracker: attributionTracker,
+            deepLinkStore: DeferredDeepLinkStore(storage: storage)
+        )
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [InstallStubProtocol.self]
+        let http = HttpClient(baseUrl: "https://stub.test", session: URLSession(configuration: config))
+        apiClient = ApiClient(httpClient: http, appKey: "test_app_key")
     }
 
     override func tearDown() async throws {
@@ -26,636 +58,322 @@ final class InstallTrackerTests: XCTestCase {
         try await super.tearDown()
     }
 
-    // MARK: - trackIfNeeded — happy path
+    // MARK: - Helpers
 
-    func testTrackIfNeeded_firstCall_firesTrackEvent() async {
+    @discardableResult
+    private func track(
+        distinctId: String = "user_001",
+        sessionId: String? = nil,
+        deviceData: DeviceData? = nil,
+        advertisingIds: AdvertisingIdResult? = nil,
+        fbAnonymousId: String? = nil,
+        referrer: MetaDeferredLinkParams? = nil,
+        idfvChanged: Bool = false
+    ) async -> Bool {
         await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
+            apiClient: apiClient,
+            distinctIdProvider: { distinctId },
+            sessionId: sessionId,
+            deviceData: deviceData,
+            advertisingIds: advertisingIds,
+            fbAnonymousId: fbAnonymousId,
+            referrer: referrer,
+            idfvChanged: idfvChanged,
+            trackEvent: { name, payload, priority in
+                self.trackedEvents.append((name: name, payload: payload, priority: priority))
+            }
         )
+    }
 
+    private func makeDeviceData(appVersion: String = "1.0.0") -> DeviceData {
+        DeviceData(
+            deviceId: "idfv-mock", model: "iPhone", modelId: "iPhone15,2",
+            systemName: "iOS", systemVersion: "17.2", appVersion: appVersion, buildNumber: "100",
+            bundleId: "com.test.app", brand: "Apple",
+            totalDisk: 128_000_000_000, freeDisk: 64_000_000_000, totalRam: 8_000_000_000,
+            carrier: "Vivo", darwinVersion: nil,
+            screenWidth: 390, screenHeight: 844, screenDensity: 3.0,
+            locale: "pt_BR", language: "pt-BR", timezone: "America/Sao_Paulo"
+        )
+    }
+
+    private var firstPayload: [String: AnyCodable] { trackedEvents.first?.payload ?? [:] }
+
+    // MARK: - Dispatch
+
+    func testFirstCall_firesTheEvent_andReturnsTrue() async {
+        let fired = await track()
+
+        XCTAssertTrue(fired)
         XCTAssertEqual(trackedEvents.count, 1)
         XCTAssertEqual(trackedEvents[0].name, "$app_installed")
+        XCTAssertEqual(trackedEvents[0].priority, .critical)
     }
 
-    func testTrackIfNeeded_eventHasPlatformIos() async {
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        let platform = trackedEvents.first?.payload["platform"]?.value as? String
-        XCTAssertEqual(platform, "ios")
+    func testFirstCall_setsInstallTrackedFlag() async {
+        await track()
+        let awaited1 = await storage.get(PaywalloConstants.installTrackedKey)
+        XCTAssertNotNil(awaited1)
     }
 
-    func testTrackIfNeeded_eventHasInstalledAt() async {
-        let before = Date().timeIntervalSince1970 * 1000
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-        let after = Date().timeIntervalSince1970 * 1000
+    /// The return value must mean "dispatched", not "resolved" — the old signature made
+    /// every early exit look like a successful send.
+    func testAlreadyTracked_returnsFalse_andDoesNotFire() async {
+        await storage.set(PaywalloConstants.installTrackedKey, value: "1700000000000")
+        await storage.set(PaywalloConstants.installAppVersionKey, value: "1.0.0")
 
-        let installedAt = trackedEvents.first?.payload["installedAt"]?.value as? Double
-        XCTAssertNotNil(installedAt)
-        XCTAssertGreaterThanOrEqual(installedAt!, before)
-        XCTAssertLessThanOrEqual(installedAt!, after)
+        let fired = await track(deviceData: makeDeviceData())
+
+        XCTAssertFalse(fired)
+        XCTAssertEqual(trackedEvents.count, 0)
     }
 
-    func testTrackIfNeeded_eventHasInstallEventId() async {
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
+    /// Residue says nothing about the deferred match having a confirmed answer — that
+    /// retry must still run, without re-lighting the install event.
+    func testNotFiring_stillRetriesTheDeferredMatch() async {
+        await storage.set(PaywalloConstants.installTrackedKey, value: "1700000000000")
+        await storage.set(PaywalloConstants.installAppVersionKey, value: "1.0.0")
+        let state = DeferredMatchState(
+            payload: Data(#"{"distinctId":"user_001"}"#.utf8),
+            firstAttemptAt: Date().timeIntervalSince1970 * 1000,
+            attempts: 0, nextAttemptAt: 0, retryAfterUntil: nil, lastForcedAttemptAt: nil
         )
+        let json = String(data: try! JSONEncoder().encode(state), encoding: .utf8)!
+        await storage.set(PaywalloConstants.deferredMatchStateKey, value: json)
 
-        let installEventId = trackedEvents.first?.payload["installEventId"]?.value as? String
-        XCTAssertNotNil(installEventId, "installEventId must be present in the payload")
-        XCTAssertFalse(installEventId!.isEmpty)
+        _ = await track(deviceData: makeDeviceData())
+
+        // The stub answers matched:false, so the attempt bumps the counter and re-persists.
+        let raw = await storage.get(PaywalloConstants.deferredMatchStateKey)
+        let updated = try? JSONDecoder().decode(DeferredMatchState.self, from: Data(raw!.utf8))
+        XCTAssertEqual(updated?.attempts, 1)
     }
 
-    func testTrackIfNeeded_eventPriorityIsCritical() async {
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
+    func testSecondCallInSameLaunch_isNoOp() async {
+        await track()
+        let second = await track()
 
-        XCTAssertEqual(trackedEvents.first?.priority, .critical)
+        XCTAssertFalse(second)
+        XCTAssertEqual(trackedEvents.count, 1)
     }
 
-    // MARK: - trackIfNeeded — idempotency (INSTALL_TRACKED)
-
-    func testTrackIfNeeded_alreadyTracked_skipsTrack() async {
-        // Pre-seed the tracked key
-        await storage.set(PaywalloConstants.installTrackedKey, value: "1")
-
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        XCTAssertEqual(trackedEvents.count, 0, "Must be a no-op when INSTALL_TRACKED is already set")
-    }
-
-    func testTrackIfNeeded_firstCall_setsInstallTrackedFlag() async {
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        let flag = await storage.get(PaywalloConstants.installTrackedKey)
-        XCTAssertEqual(flag, "1", "INSTALL_TRACKED must be set after first successful track")
-    }
-
-    func testTrackIfNeeded_secondCall_isNoOp() async {
-        // First call
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        // Second call on same tracker/storage — INSTALL_TRACKED is set
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        XCTAssertEqual(trackedEvents.count, 1, "Second call must be a no-op")
-    }
-
-    // MARK: - trackIfNeeded — two-stage idempotency (INSTALL_SENT)
-
-    func testTrackIfNeeded_withOnlyInstallSentSet_retriesAndClears() async {
-        // Simulate a crash between INSTALL_SENT and INSTALL_TRACKED
-        await storage.set(PaywalloConstants.appInstalledSentKey, value: "1")
-
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        // Must fire the event (retry)
-        XCTAssertEqual(trackedEvents.count, 1, "Must retry when only INSTALL_SENT is set (crash recovery)")
-    }
-
-    func testTrackIfNeeded_installSentCleared_afterRetry() async {
-        await storage.set(PaywalloConstants.appInstalledSentKey, value: "1")
-
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        // INSTALL_SENT must have been removed then the event fired
-        // After success, INSTALL_TRACKED is set
-        let tracked = await storage.get(PaywalloConstants.installTrackedKey)
-        XCTAssertEqual(tracked, "1")
-    }
-
-    // MARK: - trackIfNeeded — distinctId guard
-
-    func testTrackIfNeeded_emptyDistinctId_doesNotTrack() async {
-        await tracker.trackIfNeeded(
+    func testEmptyDistinctId_doesNotFire_andDoesNotMarkTracked() async {
+        let fired = await tracker.trackIfNeeded(
+            apiClient: apiClient,
             distinctIdProvider: { "" },
             sessionId: nil,
             deviceData: nil,
             advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        XCTAssertEqual(trackedEvents.count, 0, "Must not track when distinctId is empty")
-    }
-
-    // MARK: - trackIfNeeded — optional fields
-
-    func testTrackIfNeeded_withSessionId_sessionIdInPayload() async {
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: "sess_abc",
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        let sessionId = trackedEvents.first?.payload["sessionId"]?.value as? String
-        XCTAssertEqual(sessionId, "sess_abc")
-    }
-
-    func testTrackIfNeeded_withDeviceData_deviceFieldsInPayload() async {
-        let device = makeDeviceData(appVersion: "2.0.0", systemVersion: "17.0")
-
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: device,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        let payload = trackedEvents.first?.payload
-        XCTAssertEqual(payload?["appVersion"]?.value as? String, "2.0.0")
-        XCTAssertEqual(payload?["osVersion"]?.value as? String, "17.0")
-    }
-
-    func testTrackIfNeeded_withAdvertisingIds_idfvInPayload() async {
-        let ads = AdvertisingIdResult(
-            idfv: "idfv-test-1234",
-            idfa: nil,
-            attStatus: .undetermined
-        )
-
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: ads,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        let idfv = trackedEvents.first?.payload["idfv"]?.value as? String
-        XCTAssertEqual(idfv, "idfv-test-1234")
-    }
-
-    func testTrackIfNeeded_withAttribution_fbclidInPayload() async {
-        let attribution = AttributionCapture(
-            fbclid: "fb_abc123",
-            capturedAt: ISO8601DateFormatter().string(from: Date())
-        )
-
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: attribution,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-
-        let fbclid = trackedEvents.first?.payload["fbclid"]?.value as? String
-        XCTAssertEqual(fbclid, "fb_abc123")
-    }
-
-    func testTrackIfNeeded_withFbAnonymousId_inPayload() async {
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: "fb_anon_xyz",
-            trackEvent: captureEvent
-        )
-
-        let fbAnonId = trackedEvents.first?.payload["fbAnonId"]?.value as? String
-        XCTAssertEqual(fbAnonId, "fb_anon_xyz")
-    }
-
-    // MARK: - installEventId stability
-
-    func testTrackIfNeeded_installEventId_isStable_acrossCallsOnSameStorage() async {
-        // First call — sets install event ID in storage
-        await tracker.trackIfNeeded(
-            distinctIdProvider: { "user_001" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: captureEvent
-        )
-        let firstId = trackedEvents.first?.payload["installEventId"]?.value as? String
-
-        // Reset INSTALL_TRACKED so a second tracker on same storage can run
-        // (simulates a reinstall with same keychain data — edge case)
-        await storage.remove(PaywalloConstants.installTrackedKey)
-        let tracker2 = InstallTracker(storage: storage)
-        var secondEvents: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
-        await tracker2.trackIfNeeded(
-            distinctIdProvider: { "user_002" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: nil,
-            attribution: nil,
             fbAnonymousId: nil,
             trackEvent: { name, payload, priority in
-                secondEvents.append((name: name, payload: payload, priority: priority))
+                self.trackedEvents.append((name: name, payload: payload, priority: priority))
             }
         )
 
-        let secondId = secondEvents.first?.payload["installEventId"]?.value as? String
-        XCTAssertNotNil(firstId)
-        XCTAssertNotNil(secondId)
-        XCTAssertEqual(firstId, secondId, "installEventId must be stable for the same device")
+        XCTAssertFalse(fired)
+        XCTAssertEqual(trackedEvents.count, 0)
+        let awaited2 = await storage.get(PaywalloConstants.installTrackedKey)
+        XCTAssertNil(awaited2, "next boot must retry")
     }
 
-    // MARK: - performDeferredMatch — idempotency
+    // MARK: - Payload
 
-    func testPerformDeferredMatch_idempotent_secondCallIsNoOp() async {
-        // Pre-seed the deferred match done key
-        await storage.set(PaywalloConstants.deferredMatchDoneKey, value: "1")
+    func testCoreFields() async {
+        await track(sessionId: "sess_1", deviceData: makeDeviceData())
 
-        // httpClient points to a non-existent server — if the call is made it will throw
-        let httpClient = HttpClient(baseUrl: "https://127.0.0.1:1")
-
-        // Must not throw, must not crash
-        await tracker.performDeferredMatch(
-            appKey: "pk_test",
-            httpClient: httpClient,
-            deviceData: nil,
-            advertisingIds: nil
-        )
-
-        // Still "1" — was not reset
-        let flag = await storage.get(PaywalloConstants.deferredMatchDoneKey)
-        XCTAssertEqual(flag, "1")
+        XCTAssertEqual(firstPayload["platform"]?.value as? String, "ios")
+        XCTAssertEqual(firstPayload["sessionId"]?.value as? String, "sess_1")
+        XCTAssertNotNil(firstPayload["installedAt"]?.value as? Double)
+        XCTAssertNotNil(firstPayload["installEventId"]?.value as? String)
     }
 
-    func testPerformDeferredMatch_setsDoneFlag_afterAttempt() async {
-        // httpClient points to nowhere — the POST will fail, but the flag must still be set
-        let httpClient = HttpClient(baseUrl: "https://127.0.0.1:1", timeout: 1)
-
-        await tracker.performDeferredMatch(
-            appKey: "pk_test",
-            httpClient: httpClient,
-            deviceData: nil,
-            advertisingIds: nil
-        )
-
-        let flag = await storage.get(PaywalloConstants.deferredMatchDoneKey)
-        XCTAssertEqual(flag, "1", "Deferred match done flag must be set even on network failure")
+    func testInstallClassificationIsTheEnumString() async {
+        await track(deviceData: makeDeviceData())
+        XCTAssertEqual(firstPayload["installClassification"]?.value as? String, "new_install")
     }
 
-    // MARK: - performDeferredMatch — attributionTracker wired
+    /// ONE nested object, not a flattened spread — the server's key budget is 50.
+    func testInstallSignalsIsASingleNestedObject() async {
+        await track(deviceData: makeDeviceData(), idfvChanged: true)
 
-    func testPerformDeferredMatch_appliesServerResponseToAttributionTracker() async throws {
-        // Arrange: mock HTTP returns a deferred match response with fbclid
-        MockURLProtocol.reset()
-        let responseDict: [String: Any] = [
-            "fbclid": "fb_deferred_123",
-            "utmSource": "facebook",
-            "utmMedium": "cpc",
-            "utmCampaign": "test_campaign",
-        ]
-        MockURLProtocol.enqueueJSON(responseDict)
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [MockURLProtocol.self]
-        let urlSession = URLSession(configuration: config)
-
-        let httpClient = HttpClient(
-            baseUrl: "https://api.test.com",
-            timeout: 5,
-            retryConfig: RetryConfig(maxRetries: 0, baseDelay: 0, maxDelay: 0),
-            debug: false,
-            globalHeaders: [:],
-            session: urlSession
-        )
-
-        let (s, _, _) = makeIsolatedStorage()
-        let localTracker = InstallTracker(storage: s)
-        let attrStorage = SecureStorage(nativeStorage: NativeStorage(
-            service: "com.paywallo.attr.test.\(UUID().uuidString)",
-            defaults: UserDefaults(suiteName: "com.paywallo.attr.test.\(UUID().uuidString)")!
-        ))
-        let attributionTracker = AttributionTracker(storage: attrStorage)
-        await attributionTracker.loadFromStorage()
-
-        // Act
-        await localTracker.performDeferredMatch(
-            appKey: "pk_test",
-            httpClient: httpClient,
-            deviceData: nil,
-            advertisingIds: nil,
-            attributionTracker: attributionTracker
-        )
-
-        // Assert: attribution tracker received the fbclid from server response
-        let captured = attributionTracker.get()
-        XCTAssertEqual(captured?.fbclid, "fb_deferred_123", "fbclid from deferred match must be captured in attributionTracker")
-        XCTAssertEqual(captured?.utmSource, "facebook")
+        let signals = firstPayload["installSignals"]?.value as? [String: Any]
+        XCTAssertNotNil(signals)
+        XCTAssertEqual(signals?["idfvChanged"] as? Bool, true)
+        XCTAssertEqual(signals?["hasInstallTrackedKey"] as? Bool, false)
+        XCTAssertEqual(signals?["hasAppVersionKey"] as? Bool, false)
+        XCTAssertNil(firstPayload["idfvChanged"], "signals must not be flattened onto the payload")
     }
 
-    // MARK: - performDeferredMatch — body fields
-    // (HTTP body capture tests removed — see comment below)
+    /// The classifier's APP_VERSION side effect runs before the payload is built, so the
+    /// PREVIOUS value has to be read first or the snapshot loses it.
+    func testPreviousAppVersionIsCapturedBeforeTheRewrite() async {
+        await storage.set(PaywalloConstants.installAppVersionKey, value: "0.9.0")
 
-    // Note: deferred match HTTP body tests removed — CapturingURLSession mock
-    // doesn't capture request bodies reliably in this test harness. The deferred
-    // match body construction is verified by code review (InstallTracker sends
-    // "language", "installTimestamp", "platform" confirmed by Opus review agents).
+        await track(deviceData: makeDeviceData(appVersion: "1.0.0"))
 
-    // MARK: - deterministic installEventId
-
-    func testInstallEventId_deterministicFromIdfvAndAppKey() async {
-        // Storage 1: first tracker derives from idfv+appKey
-        let (s1, _, suite1) = makeIsolatedStorage()
-        let tracker1 = InstallTracker(storage: s1)
-        var events1: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
-        await tracker1.trackIfNeeded(
-            distinctIdProvider: { "user_det_1" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: AdvertisingIdResult(idfv: "idfv-stable-001", idfa: nil, attStatus: .undetermined),
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: { name, payload, priority in events1.append((name: name, payload: payload, priority: priority)) },
-            appKey: "pk_test_stable"
-        )
-        let id1 = events1.first?.payload["installEventId"]?.value as? String
-
-        // Storage 2: fresh storage, same idfv+appKey → same deterministic ID
-        let (s2, _, suite2) = makeIsolatedStorage()
-        let tracker2 = InstallTracker(storage: s2)
-        var events2: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
-        await tracker2.trackIfNeeded(
-            distinctIdProvider: { "user_det_2" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: AdvertisingIdResult(idfv: "idfv-stable-001", idfa: nil, attStatus: .undetermined),
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: { name, payload, priority in events2.append((name: name, payload: payload, priority: priority)) },
-            appKey: "pk_test_stable"
-        )
-        let id2 = events2.first?.payload["installEventId"]?.value as? String
-
-        XCTAssertNotNil(id1)
-        XCTAssertNotNil(id2)
-        XCTAssertEqual(id1, id2, "Same idfv+appKey must produce same installEventId")
-
-        UserDefaults.standard.removePersistentDomain(forName: suite1)
-        UserDefaults.standard.removePersistentDomain(forName: suite2)
+        let signals = firstPayload["installSignals"]?.value as? [String: Any]
+        XCTAssertEqual(signals?["previousAppVersion"] as? String, "0.9.0")
+        let awaited3 = await storage.get(PaywalloConstants.installAppVersionKey)
+        XCTAssertEqual(awaited3, "1.0.0")
     }
 
-    func testInstallEventId_differentInputs_differentIds() async {
-        let (s1, _, suite1) = makeIsolatedStorage()
-        let tracker1 = InstallTracker(storage: s1)
-        var events1: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
-        await tracker1.trackIfNeeded(
-            distinctIdProvider: { "user_diff_1" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: AdvertisingIdResult(idfv: "idfv-aaa", idfa: nil, attStatus: .undetermined),
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: { name, payload, priority in events1.append((name: name, payload: payload, priority: priority)) },
-            appKey: "pk_key_aaa"
-        )
-        let id1 = events1.first?.payload["installEventId"]?.value as? String
+    func testSyncedIdentitySignalsArePresent() async {
+        await track(deviceData: makeDeviceData())
 
-        let (s2, _, suite2) = makeIsolatedStorage()
-        let tracker2 = InstallTracker(storage: s2)
-        var events2: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
-        await tracker2.trackIfNeeded(
-            distinctIdProvider: { "user_diff_2" },
-            sessionId: nil,
-            deviceData: nil,
-            advertisingIds: AdvertisingIdResult(idfv: "idfv-bbb", idfa: nil, attStatus: .undetermined),
-            attribution: nil,
-            fbAnonymousId: nil,
-            trackEvent: { name, payload, priority in events2.append((name: name, payload: payload, priority: priority)) },
-            appKey: "pk_key_bbb"
-        )
-        let id2 = events2.first?.payload["installEventId"]?.value as? String
-
-        XCTAssertNotNil(id1)
-        XCTAssertNotNil(id2)
-        XCTAssertNotEqual(id1, id2, "Different idfv+appKey must produce different installEventId")
-
-        UserDefaults.standard.removePersistentDomain(forName: suite1)
-        UserDefaults.standard.removePersistentDomain(forName: suite2)
+        XCTAssertNotNil(firstPayload["syncedIdentityKeyExists"]?.value as? Bool)
+        XCTAssertNotNil(firstPayload["syncedIdentityDivergence"]?.value as? Bool)
     }
 
-    func testTrackingInProgress_concurrentCalls_onlyOneProceeds() async {
-        let (s, _, suite) = makeIsolatedStorage()
-        let t = InstallTracker(storage: s)
-        var capturedEvents: [(name: String, payload: [String: AnyCodable], priority: EventPriority)] = []
+    func testDeviceFields() async {
+        await track(deviceData: makeDeviceData())
+
+        XCTAssertEqual(firstPayload["deviceModel"]?.value as? String, "iPhone15,2")
+        XCTAssertEqual(firstPayload["osVersion"]?.value as? String, "17.2")
+        XCTAssertEqual(firstPayload["appVersion"]?.value as? String, "1.0.0")
+        XCTAssertEqual(firstPayload["buildNumber"]?.value as? String, "100")
+        XCTAssertEqual(firstPayload["locale"]?.value as? String, "pt_BR")
+        XCTAssertEqual(firstPayload["timezone"]?.value as? String, "America/Sao_Paulo")
+        XCTAssertEqual(firstPayload["carrier"]?.value as? String, "Vivo")
+        XCTAssertEqual(firstPayload["brand"]?.value as? String, "Apple")
+        XCTAssertEqual(firstPayload["totalDisk"]?.value as? Int, 128_000_000_000)
+        XCTAssertEqual(firstPayload["freeDisk"]?.value as? Int, 64_000_000_000)
+        XCTAssertEqual(firstPayload["totalRam"]?.value as? Int, 8_000_000_000)
+    }
+
+    /// "The app never asked" and "the user said no" are different answers; only the
+    /// status distinguishes them, so it always travels.
+    func testAttStatusIsAlwaysPresent() async {
+        await track()
+        XCTAssertEqual(firstPayload["attStatus"]?.value as? String, "unavailable")
+
+        InstallIdempotency.resetInstallGuardForTests()
+        trackedEvents = []
+        await storage.remove(PaywalloConstants.installTrackedKey)
+        native.remove(PaywalloConstants.legacyInstallTrackedKey)
+        await track(advertisingIds: AdvertisingIdResult(idfv: "idfv-1", idfa: nil, attStatus: .denied))
+        XCTAssertEqual(firstPayload["attStatus"]?.value as? String, "denied")
+    }
+
+    func testAdvertisingIds() async {
+        await track(advertisingIds: AdvertisingIdResult(idfv: "idfv-1", idfa: "idfa-1", attStatus: .granted))
+
+        XCTAssertEqual(firstPayload["idfv"]?.value as? String, "idfv-1")
+        XCTAssertEqual(firstPayload["idfa"]?.value as? String, "idfa-1")
+    }
+
+    /// The RN SDK does NOT emit these at the payload root from the attribution capture —
+    /// they travel in the event envelope's `context.attribution` instead.
+    func testAttributionClickIdsAreNotEmittedAtTheRoot() async {
+        await attributionTracker.capture(AttributionInput(fbclid: "fb_1", gclid: "g_1", ttclid: "tt_1"))
+
+        await track(deviceData: makeDeviceData())
+
+        XCTAssertNil(firstPayload["fbclid"])
+        XCTAssertNil(firstPayload["gclid"])
+        XCTAssertNil(firstPayload["ttclid"])
+    }
+
+    // MARK: - Referrer (Meta deferred app link)
+
+    func testReferrerFields() async {
+        let referrer = MetaDeferredLinkParams(
+            fbclid: "fb_ref", utmSource: "facebook", utmMedium: "cpc", utmCampaign: "summer",
+            ttclid: "tt_ref", trackingId: "trk_1",
+            targetUrl: "https://advertiser.example/offer",
+            raw: "https://l.facebook.com/?target_url=..."
+        )
+
+        await track(deviceData: makeDeviceData(), referrer: referrer)
+
+        XCTAssertEqual(firstPayload["installReferrer"]?.value as? String, "https://advertiser.example/offer")
+        XCTAssertEqual(firstPayload["install_referrer_raw"]?.value as? String, "https://l.facebook.com/?target_url=...")
+        XCTAssertEqual(firstPayload["install_referrer_source"]?.value as? String, "meta_deferred")
+        XCTAssertEqual(firstPayload["referrerTrackingId"]?.value as? String, "trk_1")
+        XCTAssertEqual(firstPayload["referrerFbclid"]?.value as? String, "fb_ref")
+        XCTAssertEqual(firstPayload["referrerUtmSource"]?.value as? String, "facebook")
+        XCTAssertEqual(firstPayload["referrerUtmMedium"]?.value as? String, "cpc")
+        XCTAssertEqual(firstPayload["referrerUtmCampaign"]?.value as? String, "summer")
+        XCTAssertEqual(firstPayload["ttclid"]?.value as? String, "tt_ref")
+    }
+
+    func testNoReferrer_omitsTheReferrerFields() async {
+        await track(deviceData: makeDeviceData())
+
+        XCTAssertNil(firstPayload["installReferrer"])
+        XCTAssertNil(firstPayload["install_referrer_source"])
+    }
+
+    // MARK: - fb_anon_id
+
+    func testUsesTheMetaAnonymousIdWhenAvailable() async {
+        await track(fbAnonymousId: "XZ_meta_anon")
+        XCTAssertEqual(firstPayload["fbAnonId"]?.value as? String, "XZ_meta_anon")
+    }
+
+    func testFallsBackToThePersistedAnonId() async {
+        await storage.set(PaywalloConstants.anonIdKey, value: "stored-anon")
+
+        await track(fbAnonymousId: nil)
+
+        XCTAssertEqual(firstPayload["fbAnonId"]?.value as? String, "stored-anon")
+    }
+
+    /// PW_ is not a real _fbp — Meta does not recognise it — but a stable per-device id
+    /// still lets the server stitch the install to later events.
+    func testGeneratesAndPersistsAPwFallback() async {
+        await track(fbAnonymousId: nil)
+
+        let anonId = firstPayload["fbAnonId"]?.value as? String
+        XCTAssertTrue(anonId?.hasPrefix("PW_") == true)
+        let awaited4 = await storage.get(PaywalloConstants.anonIdKey)
+        XCTAssertEqual(awaited4, anonId)
+    }
+
+    // MARK: - Install event id
+
+    func testInstallEventIdIsDeterministicFromIdfvAndAppKey() async {
+        await track(advertisingIds: AdvertisingIdResult(idfv: "idfv-1", idfa: nil, attStatus: .denied))
+
+        XCTAssertEqual(
+            firstPayload["installEventId"]?.value as? String,
+            deterministicUUID("test_app_key:idfv-1")
+        )
+    }
+
+    func testInstallEventIdFallsBackToARandomUuidWithoutIdfv() async {
+        await track(advertisingIds: nil)
+
+        let id = firstPayload["installEventId"]?.value as? String
+        XCTAssertNotNil(id)
+        XCTAssertEqual(native.get(PaywalloConstants.installEventIdKey), id)
+    }
+
+    // MARK: - Concurrency
+
+    func testConcurrentCalls_onlyOneDispatches() async {
         let lock = NSLock()
+        var captured: [String] = []
 
-        // Dispatch two concurrent calls
         await withTaskGroup(of: Void.self) { group in
-            group.addTask {
-                await t.trackIfNeeded(
-                    distinctIdProvider: { "user_concurrent" },
-                    sessionId: nil,
-                    deviceData: nil,
-                    advertisingIds: nil,
-                    attribution: nil,
-                    fbAnonymousId: nil,
-                    trackEvent: { name, payload, priority in
-                        lock.lock()
-                        capturedEvents.append((name: name, payload: payload, priority: priority))
-                        lock.unlock()
-                    }
-                )
-            }
-            group.addTask {
-                await t.trackIfNeeded(
-                    distinctIdProvider: { "user_concurrent" },
-                    sessionId: nil,
-                    deviceData: nil,
-                    advertisingIds: nil,
-                    attribution: nil,
-                    fbAnonymousId: nil,
-                    trackEvent: { name, payload, priority in
-                        lock.lock()
-                        capturedEvents.append((name: name, payload: payload, priority: priority))
-                        lock.unlock()
-                    }
-                )
+            for _ in 0..<4 {
+                group.addTask {
+                    _ = await self.tracker.trackIfNeeded(
+                        apiClient: self.apiClient,
+                        distinctIdProvider: { "user_concurrent" },
+                        sessionId: nil,
+                        deviceData: nil,
+                        advertisingIds: nil,
+                        fbAnonymousId: nil,
+                        trackEvent: { name, _, _ in
+                            lock.lock()
+                            captured.append(name)
+                            lock.unlock()
+                        }
+                    )
+                }
             }
         }
 
-        // At most 1 event should have been tracked
-        XCTAssertLessThanOrEqual(capturedEvents.count, 1, "Concurrent calls must not double-track the install event")
-
-        UserDefaults.standard.removePersistentDomain(forName: suite)
+        XCTAssertLessThanOrEqual(captured.count, 1, "concurrent calls must not double-track the install")
     }
-
-    // MARK: - Private helpers
-
-    private func captureEvent(name: String, payload: [String: AnyCodable], priority: EventPriority) async {
-        trackedEvents.append((name: name, payload: payload, priority: priority))
-    }
-
-    private func makeIsolatedStorage() -> (SecureStorage, NativeStorage, String) {
-        let suiteName = "com.paywallo.sdk.install.tests.\(UUID().uuidString)"
-        let suite = UserDefaults(suiteName: suiteName)!
-        let keychainService = suiteName
-        let native = NativeStorage(service: keychainService, defaults: suite)
-        let secure = SecureStorage(nativeStorage: native)
-        return (secure, native, suiteName)
-    }
-
-    private func makeDeviceData(
-        appVersion: String = "1.0.0",
-        systemVersion: String = "16.0",
-        locale: String = "en_US"
-    ) -> DeviceData {
-        DeviceData(
-            deviceId: "idfv-mock",
-            model: "iPhone",
-            modelId: "iPhone15,2",
-            systemName: "iOS",
-            systemVersion: systemVersion,
-            appVersion: appVersion,
-            buildNumber: "100",
-            bundleId: "com.test.app",
-            brand: "Apple",
-            totalDisk: 128_000_000_000,
-            freeDisk: 64_000_000_000,
-            totalRam: 8_000_000_000,
-            carrier: "Vivo",
-            darwinVersion: nil,
-            screenWidth: 390,
-            screenHeight: 844,
-            screenDensity: 3.0,
-            locale: locale,
-            language: locale,
-            timezone: "America/Sao_Paulo"
-        )
-    }
-}
-
-// MARK: - CapturingURLSession
-
-/// Lightweight URLSession substitute that captures the last request body.
-/// Returns a minimal 200 response so HttpClient sees a successful call.
-private final class CapturingURLSession: @unchecked Sendable {
-    var lastBody: Data?
-
-    func asURLSession() -> URLSession {
-        let config = URLSessionConfiguration.ephemeral
-        config.protocolClasses = [CapturingURLProtocol.self]
-        let session = URLSession(configuration: config)
-        // Store reference to self so the protocol can write back
-        CapturingURLProtocol.onRequest = { [weak self] data in
-            self?.lastBody = data
-        }
-        return session
-    }
-}
-
-private final class CapturingURLProtocol: URLProtocol {
-    static var onRequest: ((Data?) -> Void)?
-
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-
-    override func startLoading() {
-        CapturingURLProtocol.onRequest?(request.httpBody)
-
-        let response = HTTPURLResponse(
-            url: request.url!,
-            statusCode: 200,
-            httpVersion: "HTTP/1.1",
-            headerFields: [:]
-        )!
-        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data())
-        client?.urlProtocolDidFinishLoading(self)
-    }
-
-    override func stopLoading() {}
 }

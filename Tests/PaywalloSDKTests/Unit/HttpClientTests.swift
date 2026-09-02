@@ -349,6 +349,57 @@ final class HttpClientTests: XCTestCase {
         XCTAssertEqual(response.status, 404)
     }
 
+    // MARK: - 11b. SSL failures are permanent, never retried
+
+    func testSslErrorIsNotRetried() async {
+        for _ in 0..<3 { MockURLProtocol.enqueueError(URLError(.serverCertificateUntrusted)) }
+
+        do {
+            _ = try await client.getRaw(path: "/ping")
+            XCTFail("erro de SSL deve propagar")
+        } catch {
+            XCTAssertEqual(MockURLProtocol.capturedRequests.count, 1,
+                           "certificado ruim não é transitório — retentar só queima bateria e rede")
+        }
+    }
+
+    func testSecureConnectionFailedIsNotRetried() async {
+        for _ in 0..<3 { MockURLProtocol.enqueueError(URLError(.secureConnectionFailed)) }
+
+        do {
+            _ = try await client.getRaw(path: "/ping")
+            XCTFail("erro de SSL deve propagar")
+        } catch {
+            XCTAssertEqual(MockURLProtocol.capturedRequests.count, 1)
+        }
+    }
+
+    func testCertificateMessageErrorIsNotRetried() async {
+        let certError = NSError(domain: "test", code: 1,
+                                userInfo: [NSLocalizedDescriptionKey: "ERR_CERT_AUTHORITY_INVALID"])
+        for _ in 0..<3 { MockURLProtocol.enqueueError(certError) }
+
+        do {
+            _ = try await client.getRaw(path: "/ping")
+            XCTFail("erro de certificado deve propagar")
+        } catch {
+            XCTAssertEqual(MockURLProtocol.capturedRequests.count, 1,
+                           "erro de cert que chega como NSError também é permanente")
+        }
+    }
+
+    func testPlainNetworkErrorIsStillRetried() async {
+        for _ in 0..<3 { MockURLProtocol.enqueueError(URLError(.networkConnectionLost)) }
+
+        do {
+            _ = try await client.getRaw(path: "/ping")
+            XCTFail("erro de rede esgotado deve propagar")
+        } catch {
+            XCTAssertEqual(MockURLProtocol.capturedRequests.count, 3,
+                           "erro de rede comum continua sendo transitório (1 + 2 retries)")
+        }
+    }
+
     // MARK: - 12. Retry-After header honored (seconds format)
 
     func testRetryAfterHeaderHonored() async throws {

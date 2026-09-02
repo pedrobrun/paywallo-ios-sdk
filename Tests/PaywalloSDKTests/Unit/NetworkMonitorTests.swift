@@ -21,9 +21,28 @@ final class NetworkMonitorTests: XCTestCase {
 
     // MARK: - Pre-initialization state
 
-    func testIsOnlineReturnsTrueBeforeInit() {
-        // Optimistic default — should not block on cold start
-        XCTAssertTrue(monitor.isOnline(), "isOnline() must return true before initialize() is called")
+    func testIsOnlineReturnsFalseBeforeInit() {
+        // Pessimistic by design: an optimistic `true` made PendingRetry.process() burn both
+        // of a critical event's attempts in ~6 minutes offline.
+        XCTAssertFalse(monitor.isOnline(), "isOnline() must return false before initialize() is called")
+    }
+
+    func testGetStateIsUnknownBeforeInit() {
+        XCTAssertEqual(monitor.getState(), .unknown)
+    }
+
+    func testForceCheckIsUnknownBeforeInit() {
+        XCTAssertEqual(monitor.forceCheck(), .unknown)
+    }
+
+    func testGetStateIsNeverUnknownAfterInit() {
+        monitor.initialize()
+        XCTAssertNotEqual(monitor.getState(), .unknown, "depois do initialize o estado é medido")
+    }
+
+    func testIsOnlineAgreesWithGetState() {
+        monitor.initialize()
+        XCTAssertEqual(monitor.isOnline(), monitor.getState() == .online)
     }
 
     func testIsInitializedReturnsFalseBeforeInit() {
@@ -107,11 +126,11 @@ final class NetworkMonitorTests: XCTestCase {
         XCTAssertFalse(monitor.isInitialized(), "dispose() must reset isInitialized to false")
     }
 
-    func testDisposeResetsIsOnlineToOptimistic() {
+    func testDisposeResetsIsOnlineToPessimistic() {
         monitor.initialize()
         monitor.dispose()
-        // After dispose, uninitialized → optimistic true
-        XCTAssertTrue(monitor.isOnline(), "After dispose, isOnline() should return true (optimistic, uninitialized)")
+        XCTAssertFalse(monitor.isOnline(), "After dispose the monitor is uninitialized → offline")
+        XCTAssertEqual(monitor.getState(), .unknown)
     }
 
     func testDisposeDoesNotCrashWithNoListeners() {

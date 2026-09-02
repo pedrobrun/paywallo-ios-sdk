@@ -492,30 +492,132 @@ final class ApiClientTests: XCTestCase {
         }
     }
 
-    // MARK: - 19. ApiClientQueue offline enqueue
+    // MARK: - 19. resolveApiUrl
 
-    func testApiClientQueue_offlineEnqueuesItem() async {
-        // Arrange
+    func testResolveApiUrl_noOverrideReturnsDefault() throws {
+        XCTAssertEqual(try ApiClient.resolveApiUrl(nil), PaywalloConstants.defaultApiUrl)
+        XCTAssertEqual(try ApiClient.resolveApiUrl(""), PaywalloConstants.defaultApiUrl)
+    }
+
+    func testResolveApiUrl_httpsOverrideIsAccepted() throws {
+        XCTAssertEqual(try ApiClient.resolveApiUrl("https://staging.example.com"), "https://staging.example.com")
+    }
+
+    func testResolveApiUrl_httpLocalhostIsAccepted() throws {
+        XCTAssertEqual(try ApiClient.resolveApiUrl("http://localhost:3000"), "http://localhost:3000")
+        XCTAssertEqual(try ApiClient.resolveApiUrl("http://127.0.0.1:18101"), "http://127.0.0.1:18101")
+        XCTAssertEqual(try ApiClient.resolveApiUrl("http://192.168.0.42:3000"), "http://192.168.0.42:3000")
+    }
+
+    func testResolveApiUrl_httpProductionThrows() {
+        XCTAssertThrowsError(try ApiClient.resolveApiUrl("http://api.example.com")) { error in
+            let clientError = error as? ClientError
+            XCTAssertEqual(clientError?.code, ClientErrorCode.invalidApiUrl)
+            XCTAssertEqual(clientError?.message,
+                           "config.apiUrl must be https, or http on localhost/192.168.x for local dev: \"http://api.example.com\"")
+        }
+    }
+
+    func testResolveApiUrl_malformedThrowsInsteadOfFallingBack() {
+        // Cair silenciosamente na produção é como um teste em device acaba gravando evento real.
+        XCTAssertThrowsError(try ApiClient.resolveApiUrl("not a url at all")) { error in
+            let clientError = error as? ClientError
+            XCTAssertEqual(clientError?.code, ClientErrorCode.invalidApiUrl)
+            XCTAssertEqual(clientError?.message, "config.apiUrl is not a valid URL: \"not a url at all\"")
+        }
+    }
+
+    func testResolveApiUrl_unsupportedSchemeThrows() {
+        XCTAssertThrowsError(try ApiClient.resolveApiUrl("ftp://example.com"))
+    }
+
+    // MARK: - 20. User-Agent
+
+    func testUserAgent_hasSdkPrefixAndParenthesisedDetail() {
+        let userAgent = buildUserAgent(sdkVersion: "9.9.9")
+        XCTAssertTrue(userAgent.hasPrefix("PaywalloSDK/9.9.9 ("), "UA: \(userAgent)")
+        XCTAssertTrue(userAgent.hasSuffix(")"), "UA: \(userAgent)")
+    }
+
+    func testUserAgent_isAsciiPrintableOnly() {
+        let userAgent = buildUserAgent(sdkVersion: PaywalloConstants.sdkVersion)
+        for scalar in userAgent.unicodeScalars {
+            XCTAssertTrue(scalar.value >= 0x20 && scalar.value <= 0x7E,
+                          "UA precisa ser ASCII imprimível para não quebrar a validação de header: \(userAgent)")
+        }
+    }
+
+    func testUserAgent_neverEmitsUnknownSegments() {
+        let userAgent = buildUserAgent(sdkVersion: PaywalloConstants.sdkVersion)
+        XCTAssertFalse(userAgent.contains("unknown"), "segmento desconhecido é omitido, não impresso: \(userAgent)")
+    }
+
+    func testUserAgent_isSentOnBothHeaders() async throws {
+        MockURLProtocol.reset()
+        MockURLProtocol.enqueueResponse(statusCode: 200, data: Data("{}".utf8))
+
+        let client = ApiClient(httpClient: makeMockHttpClient(), appKey: "pk_ua")
+        _ = try? await client.post(path: "/sdk/errors", body: Data("{}".utf8))
+
+        let request = MockURLProtocol.capturedRequests.first
+        let userAgent = request?.value(forHTTPHeaderField: "User-Agent")
+        XCTAssertEqual(userAgent, buildUserAgent(sdkVersion: PaywalloConstants.sdkVersion))
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "x-sdk-user-agent"), userAgent)
+    }
+
+    // MARK: - 21. normalizeDateOfBirth
+
+    func testNormalizeDateOfBirth_passesThroughIsoDate() {
+        XCTAssertEqual(ApiClient.normalizeDateOfBirth("1990-05-17"), "1990-05-17")
+    }
+
+    func testNormalizeDateOfBirth_convertsTimestampUsingUTC() {
+        XCTAssertEqual(ApiClient.normalizeDateOfBirth("1990-05-17T00:30:00Z"), "1990-05-17")
+    }
+
+    func testNormalizeDateOfBirth_returnsNilForGarbage() {
+        XCTAssertNil(ApiClient.normalizeDateOfBirth("not-a-date"))
+        XCTAssertNil(ApiClient.normalizeDateOfBirth(nil))
+        XCTAssertNil(ApiClient.normalizeDateOfBirth(""))
+    }
+
+    // MARK: - 22. onError
+
+    func testNotifyErrorForwardsPaywalloErrorUnchanged() {
+        let client = makeClient()
+        var received: PaywalloError?
+        client.onError = { received = $0 }
+
+        let original = ClientError(code: ClientErrorCode.eventDeliveryFailed, message: "boom")
+        client.notifyError(original)
+
+        XCTAssertTrue(received === original)
+    }
+
+    func testNotifyErrorWrapsForeignErrors() {
+        let client = makeClient()
+        var received: PaywalloError?
+        client.onError = { received = $0 }
+
+        client.notifyError(URLError(.notConnectedToInternet))
+
+        XCTAssertEqual(received?.code, ClientErrorCode.unknown)
+        XCTAssertEqual(received?.domain, "client")
+    }
+
+    func testPostCallsOnErrorBeforeRethrowing() async {
         MockURLProtocol.reset()
         MockURLProtocol.enqueueError(URLError(.notConnectedToInternet))
 
-        let offlineQueue = OfflineQueue()
-        offlineQueue.initialize()
+        let client = ApiClient(httpClient: makeMockHttpClient(), appKey: "pk_err")
+        var received: PaywalloError?
+        client.onError = { received = $0 }
 
-        let httpClient = makeMockHttpClient()
-        let apiClient = ApiClient(httpClient: httpClient, appKey: "pk_test_queue")
-        let monitor = NetworkMonitor()
-        let queue = ApiClientQueue(apiClient: apiClient, offlineQueue: offlineQueue, networkMonitor: monitor, debug: false)
-
-        let body = try! JSONSerialization.data(withJSONObject: ["test": true])
-
-        // Act
-        let result = await queue.execute(method: "POST", path: "/sdk/identity/identify", body: body, priority: .normal)
-
-        // Assert: either network failed and item was enqueued, or network succeeded (also valid)
-        if result == nil {
-            XCTAssertGreaterThan(offlineQueue.count, 0, "Offline queue must have item when network fails")
+        do {
+            _ = try await client.post(path: "/sdk/errors", body: Data("{}".utf8))
+            XCTFail("post deveria propagar o erro de rede")
+        } catch {
+            XCTAssertNotNil(received, "onError precisa disparar antes da propagação")
         }
-        // If online and succeeded, result is non-nil — test passes silently
     }
 }

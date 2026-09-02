@@ -75,6 +75,10 @@ public final class NotificationEventBuffer {
         return events
     }
 
+    /// Oldest buffered event, left in place. Used by `getInitialNotification()`, which
+    /// must not consume what the `onOpened` subscribers are still waiting for.
+    public var first: NotificationPayload? { buffer.first }
+
     public var count: Int { buffer.count }
 }
 
@@ -134,6 +138,10 @@ public struct NotificationHandlers {
     public func drainReceived() -> [NotificationPayload] { receivedBuffer.drain() }
     public func drainOpened()   -> [NotificationPayload] { openedBuffer.drain() }
     public func drainDismissed() -> [NotificationPayload] { dismissedBuffer.drain() }
+
+    /// First buffered "opened" payload, left in place — the cold-start notification when
+    /// the app was launched by a tap and no subscriber had attached yet.
+    public func peekOpened() -> NotificationPayload? { openedBuffer.first }
 }
 
 // MARK: - UNUserNotificationCenterDelegate Bridge

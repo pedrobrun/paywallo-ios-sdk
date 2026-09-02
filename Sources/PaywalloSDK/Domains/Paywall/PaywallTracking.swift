@@ -59,7 +59,10 @@ public final class PaywallTracking {
             "placement": AnyCodable(placement),
             "opened_at": AnyCodable(ISO8601DateFormatter().string(from: Date())),
         ]
-        if let v = sessionId   { v2Props["session_id"]   = AnyCodable(v) }
+        // `sessionId` camelCase, igual ao `closed` e ao recovery de heartbeat — é a chave
+        // que o RN emite em TODOS os eventos de paywall (viewed e closed). Emitir
+        // `session_id` só aqui deixava o `viewed` sem sessão do lado do servidor.
+        if let v = sessionId   { v2Props["sessionId"]    = AnyCodable(v) }
         if let v = variantKey  { v2Props["variant_key"]  = AnyCodable(v) }
         if let v = campaignId  { v2Props["campaign_id"]  = AnyCodable(v) }
         if let v = variantId   { v2Props["variant_id"]   = AnyCodable(v) }
@@ -97,7 +100,10 @@ public final class PaywallTracking {
         if let v = variantKey      { props["variant_key"]  = AnyCodable(v) }
         if let v = variantId       { props["variant_id"]   = AnyCodable(v) }
         if let v = campaignId      { props["campaign_id"]  = AnyCodable(v) }
-        if let v = sessionId       { props["session_id"]   = AnyCodable(v) }
+        // `sessionId` camelCase de propósito: é a chave que o RN emite no `closed` e a
+        // que o recovery de heartbeat já usa. Emitir `session_id` aqui deixava metade
+        // dos `closed` sem sessão do lado do servidor.
+        if let v = sessionId       { props["sessionId"]    = AnyCodable(v) }
 
         batcher.enqueue(name: "paywall", properties: props, priority: .critical, timestamp: nil)
 

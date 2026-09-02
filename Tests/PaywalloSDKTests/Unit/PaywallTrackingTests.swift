@@ -293,10 +293,10 @@ final class PaywallTrackingTests: XCTestCase {
         XCTAssertEqual(batcher.enqueuedEvents.first?.priority, .critical)
     }
 
-    // MARK: - emitPaywallClosed — session_id (snake_case)
+    // MARK: - emitPaywallClosed — sessionId (camelCase, igual ao RN)
 
     func testEmitPaywallClosed_noActiveSession_sessionIdAbsent() {
-        // sessionManager has no active session — session_id must not be injected
+        // sessionManager has no active session — sessionId must not be injected
         tracking.emitPaywallClosed(
             paywallId: "pw_123",
             placement: "home",
@@ -304,8 +304,8 @@ final class PaywallTrackingTests: XCTestCase {
             closeReason: "dismiss"
         )
 
-        XCTAssertNil(batcher.enqueuedEvents.first?.properties["session_id"],
-                     "session_id must be absent when no session is active")
+        XCTAssertNil(batcher.enqueuedEvents.first?.properties["sessionId"],
+                     "sessionId must be absent when no session is active")
     }
 
     func testEmitPaywallClosed_withActiveSession_sessionIdPresent() async throws {
@@ -318,12 +318,31 @@ final class PaywallTrackingTests: XCTestCase {
             closeReason: "purchase"
         )
 
-        let sessionId = batcher.enqueuedEvents.first?.properties["session_id"]?.value as? String
-        XCTAssertNotNil(sessionId, "session_id must be present when a session is active")
+        let sessionId = batcher.enqueuedEvents.first?.properties["sessionId"]?.value as? String
+        XCTAssertNotNil(sessionId, "sessionId must be present when a session is active")
         XCTAssertFalse(sessionId!.isEmpty)
     }
 
-    // MARK: - emitPaywallVisible — session_id injected in V2 event
+    func testEmitPaywallClosed_doesNotEmitSnakeCaseSessionKey() async throws {
+        // O recovery de heartbeat já emitia `sessionId`; o `closed` normal emitia
+        // `session_id` e metade dos rows ficava sem sessão do lado do servidor.
+        try await sessionManager.startSession(distinctIdProvider: { "user_abc" })
+
+        tracking.emitPaywallClosed(
+            paywallId: "pw_123",
+            placement: "home",
+            durationS: 4.0,
+            closeReason: "dismiss"
+        )
+
+        XCTAssertNil(batcher.enqueuedEvents.first?.properties["session_id"])
+    }
+
+    // MARK: - emitPaywallVisible — sessionId injected in V2 event
+    //
+    // camelCase `sessionId`, matching the RN SDK on every paywall event (viewed AND closed)
+    // and the heartbeat recovery path. Emitting snake_case here left `viewed` without a
+    // session server-side while `closed` had one.
 
     func testEmitPaywallVisible_withActiveSession_v2HasSessionId() async throws {
         try await sessionManager.startSession(distinctIdProvider: { "user_abc" })
@@ -331,16 +350,17 @@ final class PaywallTrackingTests: XCTestCase {
         tracking.emitPaywallVisible(paywallId: "pw_123", placement: "home")
 
         let v2Event = batcher.enqueuedEvents.first(where: { $0.name == "paywall" })
-        let sessionId = v2Event?.properties["session_id"]?.value as? String
-        XCTAssertNotNil(sessionId)
-        XCTAssertFalse(sessionId!.isEmpty)
+        let sessionId = try XCTUnwrap(v2Event?.properties["sessionId"]?.value as? String)
+        XCTAssertFalse(sessionId.isEmpty)
+        XCTAssertNil(v2Event?.properties["session_id"],
+                     "DESVIO: paywall events usam sessionId (camelCase), nunca session_id")
     }
 
     func testEmitPaywallVisible_noSession_v2LacksSessionId() {
         tracking.emitPaywallVisible(paywallId: "pw_123", placement: "home")
 
         let v2Event = batcher.enqueuedEvents.first(where: { $0.name == "paywall" })
-        XCTAssertNil(v2Event?.properties["session_id"])
+        XCTAssertNil(v2Event?.properties["sessionId"])
     }
 
     // MARK: - emitPaywallClosed — duration_s calculation (via caller)

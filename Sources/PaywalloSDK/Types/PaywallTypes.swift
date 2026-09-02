@@ -7,6 +7,7 @@ public struct PaywallConfig: Codable, Sendable {
     public var content: AnyCodable?
     public var primaryProductId: String?
     public var secondaryProductId: String?
+    public var tertiaryProductId: String?
 
     public init(
         id: String,
@@ -14,7 +15,8 @@ public struct PaywallConfig: Codable, Sendable {
         config: [String: AnyCodable],
         content: AnyCodable? = nil,
         primaryProductId: String? = nil,
-        secondaryProductId: String? = nil
+        secondaryProductId: String? = nil,
+        tertiaryProductId: String? = nil
     ) {
         self.id = id
         self.placement = placement
@@ -22,6 +24,7 @@ public struct PaywallConfig: Codable, Sendable {
         self.content = content
         self.primaryProductId = primaryProductId
         self.secondaryProductId = secondaryProductId
+        self.tertiaryProductId = tertiaryProductId
     }
 }
 

@@ -61,9 +61,7 @@ final class PaywallPreloadServiceTests: XCTestCase {
         staggerDelay: TimeInterval = 0
     ) -> PaywallPreloadService {
         // IAPService with no StoreKit products — loadProducts returns [] for all ids.
-        let suite = UserDefaults(suiteName: "com.paywallo.sdk.tests.preload.\(UUID().uuidString)")!
-        let storage = NativeStorage(service: "com.paywallo.sdk.tests.preload.\(UUID().uuidString)", defaults: suite)
-        let iap = IAPService(apiClient: apiClient, offlineQueue: OfflineQueue(storage: storage), debug: false)
+        let iap = IAPService(apiClient: apiClient, debug: false)
         return PaywallPreloadService(
             apiClient: apiClient,
             iapService: iap,
@@ -216,9 +214,53 @@ final class PaywallPreloadServiceTests: XCTestCase {
         let apiClient = makeApiClient()
         let service = makeService(apiClient: apiClient)
 
-        await service.preload("error_placement")
+        _ = await service.preload("error_placement")
 
         XCTAssertFalse(service.isPaywallPreloaded("error_placement"),
                        "Failed fetch must not cache any entry")
+    }
+
+    // MARK: - 9. preload devolve sucesso/erro em vez de engolir no log
+
+    func testPreloadReturnsSuccessWhenCached() async throws {
+        MockURLProtocol.enqueueJSON(paywallConfigJSON(placement: "home"))
+
+        let service = makeService(apiClient: makeApiClient())
+        let result = await service.preload("home")
+
+        XCTAssertTrue(result.success)
+        XCTAssertNil(result.error)
+    }
+
+    func testPreloadReturnsErrorOnNetworkFailure() async throws {
+        MockURLProtocol.enqueueError(URLError(.networkConnectionLost))
+
+        let service = makeService(apiClient: makeApiClient())
+        let result = await service.preload("error_placement")
+
+        XCTAssertFalse(result.success)
+        XCTAssertNotNil(result.error, "O caller precisa do erro para reagir — o log não basta")
+    }
+
+    func testPreloadOfMissingPaywallReportsNotFound() async throws {
+        // O transporte não lança em 404: o corpo simplesmente não decodifica em
+        // PaywallConfig — é o "config nulo" do RN.
+        MockURLProtocol.enqueueJSON(["error": "not found"])
+
+        let service = makeService(apiClient: makeApiClient())
+        let result = await service.preload("ghost_placement")
+
+        XCTAssertFalse(result.success)
+        XCTAssertEqual((result.error as? PaywalloError)?.code, PaywallErrorCode.notFound)
+    }
+
+    func testPreloadFreshCacheHitReportsSuccess() async throws {
+        MockURLProtocol.enqueueJSON(paywallConfigJSON(placement: "offers"))
+
+        let service = makeService(apiClient: makeApiClient())
+        _ = await service.preload("offers")
+        let second = await service.preload("offers")   // cache hit, sem rede
+
+        XCTAssertTrue(second.success)
     }
 }

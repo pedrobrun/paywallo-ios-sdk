@@ -9,24 +9,18 @@ public enum PaywallCloseReason {
     public static let canonical: Set<String> = ["dismiss", "cta", "purchase", "error", "timeout"]
 
     /// Maps a legacy or canonical close reason string to its canonical form.
-    /// Returns the input unchanged if it is already canonical.
-    /// Returns "dismiss" as the default fallback for unknown values.
+    /// Anything outside the legacy map is returned unchanged — collapsing unknown
+    /// values into "dismiss" hid every reason the enum grows to carry, and the
+    /// canonical set is validated server-side anyway.
     public static func canonicalize(_ reason: String) -> String {
         switch reason {
         // Legacy → canonical
         case "dismissed":   return "dismiss"
         case "purchased":   return "purchase"
         case "backgrounded": return "dismiss"
-        case "timeout":     return "timeout"
 
-        // Already canonical
-        case "dismiss":     return "dismiss"
-        case "cta":         return "cta"
-        case "purchase":    return "purchase"
-        case "error":       return "error"
-
-        // Unknown → default
-        default:            return "dismiss"
+        // Já canônico (ou desconhecido) → passa cru
+        default:            return reason
         }
     }
 

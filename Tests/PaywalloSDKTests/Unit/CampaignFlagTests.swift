@@ -311,17 +311,16 @@ final class CampaignGateServiceTests: XCTestCase {
         service.invalidateAllCache()
     }
 
-    // MARK: - waitForPreload timeout
+    // MARK: - waitForPreload
 
-    func testWaitForPreload_noPreloadRunning_returnsNilAfterTimeout() async {
+    func testWaitForPreload_noPreloadRunning_returnsImmediately() async {
         let apiClient = ApiClient(serverUrl: "http://localhost:9999", appKey: "pk_test")
-        let subscriptionCache = SubscriptionCache()
-        let subscriptionManager = SubscriptionManager(cache: subscriptionCache)
+        let subscriptionManager = SubscriptionManager(cache: SubscriptionCache())
         let service = CampaignGateService(
             apiClient: apiClient,
             subscriptionManager: subscriptionManager,
-            waitPollInterval: 0.05,
-            waitMaxDuration: 0.2  // 200ms timeout for fast test
+            waitPollInterval: 0.5,
+            waitMaxDuration: 2.0  // teto real — não pode ser pago no caminho frio
         )
 
         let start = Date()
@@ -329,7 +328,157 @@ final class CampaignGateServiceTests: XCTestCase {
         let elapsed = Date().timeIntervalSince(start)
 
         XCTAssertNil(result)
-        XCTAssertLessThan(elapsed, 1.0, "Should timeout within 1 second")
+        XCTAssertLessThan(
+            elapsed, 0.3,
+            "Sem preload em voo não há o que esperar — dormir o teto aqui custava 2s em toda apresentação fria"
+        )
+    }
+
+    // MARK: - Erro de rede não vira cache
+
+    func testFetchFailure_doesNotCacheTombstone() async {
+        MockURLProtocol.reset()
+        defer { MockURLProtocol.reset() }
+        MockURLProtocol.enqueueError(URLError(.networkConnectionLost))
+        MockURLProtocol.enqueueError(URLError(.networkConnectionLost))
+
+        let service = makeMockedService()
+
+        _ = await service.preloadCampaign("home", distinctId: "user_1")
+        _ = await service.preloadCampaign("home", distinctId: "user_1")
+
+        XCTAssertEqual(
+            MockURLProtocol.capturedRequests.count, 2,
+            "Falha transitória não pode virar entrada de cache com TTL cheio — bloqueava a campanha por 5 min"
+        )
+    }
+
+    // MARK: - resolveCampaign: "não encontrada" ≠ "assinante"
+
+    func testResolveCampaign_noCampaign_returnsNotFound() async {
+        MockURLProtocol.reset()
+        defer { MockURLProtocol.reset() }
+        MockURLProtocol.enqueueError(URLError(.networkConnectionLost))
+
+        let service = makeMockedService()
+        let outcome = await service.resolveCampaign(placement: "home", distinctId: "user_1")
+
+        guard case .notFound(let error) = outcome else {
+            return XCTFail("Esperava .notFound, veio \(outcome)")
+        }
+        XCTAssertEqual(error.code, CampaignErrorCode.notFound)
+    }
+
+    func testResolveCampaign_found_returnsCampaign() async {
+        MockURLProtocol.reset()
+        defer { MockURLProtocol.reset() }
+        MockURLProtocol.enqueueJSON(campaignJSON(placement: "home"))
+
+        let service = makeMockedService()
+        let outcome = await service.resolveCampaign(placement: "home", distinctId: "user_1")
+
+        guard case .campaign(let campaign) = outcome else {
+            return XCTFail("Esperava .campaign, veio \(outcome)")
+        }
+        XCTAssertEqual(campaign.placement, "home")
+    }
+
+    func testResolveCampaign_activeSubscriber_returnsSubscriber() async {
+        MockURLProtocol.reset()
+        defer { MockURLProtocol.reset() }
+        MockURLProtocol.enqueueJSON(campaignJSON(placement: "home"))
+
+        let subscriptionManager = await makeSubscribedManager()
+        let service = makeMockedService(subscriptionManager: subscriptionManager)
+        let outcome = await service.resolveCampaign(placement: "home", distinctId: "user_1")
+
+        guard case .subscriber = outcome else {
+            return XCTFail("Esperava .subscriber, veio \(outcome)")
+        }
+    }
+
+    func testResolveCampaign_activeSubscriberButPlacementMissing_reportsNotFound() async {
+        // A campanha é resolvida ANTES da checagem de assinatura: invertido, um
+        // placement errado ficava invisível para todo assinante.
+        MockURLProtocol.reset()
+        defer { MockURLProtocol.reset() }
+        MockURLProtocol.enqueueError(URLError(.networkConnectionLost))
+
+        let subscriptionManager = await makeSubscribedManager()
+        let service = makeMockedService(subscriptionManager: subscriptionManager)
+        let outcome = await service.resolveCampaign(placement: "ghost", distinctId: "user_1")
+
+        guard case .notFound = outcome else {
+            return XCTFail("Esperava .notFound, veio \(outcome)")
+        }
+    }
+
+    func testResolveCampaign_forceShow_skipsSubscriptionCheck() async {
+        MockURLProtocol.reset()
+        defer { MockURLProtocol.reset() }
+        MockURLProtocol.enqueueJSON(campaignJSON(placement: "promo"))
+
+        let subscriptionManager = await makeSubscribedManager()
+        let service = makeMockedService(subscriptionManager: subscriptionManager)
+        let outcome = await service.resolveCampaign(
+            placement: "promo",
+            distinctId: "user_1",
+            forceShow: true
+        )
+
+        guard case .campaign = outcome else {
+            return XCTFail("Esperava .campaign, veio \(outcome)")
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func makeMockedService(
+        subscriptionManager: SubscriptionManager? = nil
+    ) -> CampaignGateService {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockURLProtocol.self]
+        let httpClient = HttpClient(
+            baseUrl: "https://api.paywallo.com",
+            timeout: 10,
+            retryConfig: RetryConfig(maxRetries: 0, baseDelay: 0, maxDelay: 0),
+            debug: false,
+            globalHeaders: [:],
+            session: URLSession(configuration: config)
+        )
+        let apiClient = ApiClient(httpClient: httpClient, appKey: "pk_test", debug: false, environment: .production)
+        return CampaignGateService(
+            apiClient: apiClient,
+            subscriptionManager: subscriptionManager ?? SubscriptionManager(cache: SubscriptionCache()),
+            waitPollInterval: 0.02,
+            waitMaxDuration: 0.2
+        )
+    }
+
+    /// SubscriptionManager com o cache pré-aquecido em "assinante ativo" — o `get`
+    /// serve da memória, então não há rede envolvida.
+    private func makeSubscribedManager() async -> SubscriptionManager {
+        let cache = SubscriptionCache()
+        await cache.set("__anonymous__", data: SubscriptionStatusResponse(
+            hasActiveSubscription: true,
+            subscription: nil
+        ))
+        let manager = SubscriptionManager(cache: cache)
+        manager.initialize(SubscriptionManagerConfig(serverUrl: "https://api.paywallo.com", appKey: "pk_test"))
+        return manager
+    }
+
+    private func campaignJSON(placement: String) -> [String: Any] {
+        [
+            "campaignId": "camp_\(placement)",
+            "placement": placement,
+            "variantKey": "control",
+            "paywall": [
+                "id": "pw_\(placement)",
+                "placement": placement,
+                "config": [String: Any](),
+            ],
+        ]
     }
 }
 

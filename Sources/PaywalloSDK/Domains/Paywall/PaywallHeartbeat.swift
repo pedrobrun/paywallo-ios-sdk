@@ -50,9 +50,13 @@ public final class PaywallHeartbeat {
     // MARK: - Crash Recovery
 
     private func checkForCrashRecovery() {
-        guard let raw = storage.get(storageKey),
+        // `paywallId` vazio ou `presentedAt`/`lastSeen` não-numéricos fecham o row do
+        // servidor com lixo — melhor não recuperar do que recuperar errado. O decode
+        // já rejeita os tipos; o id vazio precisa da checagem explícita.
+        guard let raw = readPersistedSnapshotRaw(),
               let data = raw.data(using: .utf8),
-              let snapshot = try? JSONDecoder().decode(HeartbeatSnapshot.self, from: data)
+              let snapshot = try? JSONDecoder().decode(HeartbeatSnapshot.self, from: data),
+              !snapshot.paywallId.isEmpty
         else { return }
 
         // A snapshot exists → previous session crashed while paywall was open
@@ -63,6 +67,20 @@ public final class PaywallHeartbeat {
 
         // Notify caller with full snapshot
         onCrashRecovery?(snapshot, durationS)
+    }
+
+    /// Lê o snapshot persistido, migrando em silêncio da chave legada `@panel:` quando
+    /// a atual está vazia. Um app que atualizou do SDK ≤2.x com o paywall aberto no
+    /// crash tem o snapshot só na chave antiga, e o `closed` daquele row se perderia.
+    /// A legada é apagada depois da cópia — deixar as duas faria o próximo boot
+    /// recuperar o mesmo paywall de novo.
+    private func readPersistedSnapshotRaw() -> String? {
+        if let raw = storage.get(storageKey), !raw.isEmpty { return raw }
+        guard let legacy = storage.get(PaywalloConstants.legacyPaywallHeartbeatKey),
+              !legacy.isEmpty else { return nil }
+        storage.set(storageKey, value: legacy)
+        storage.remove(PaywalloConstants.legacyPaywallHeartbeatKey)
+        return legacy
     }
 
     private var storageKey: String { PaywallHeartbeat.storageKey }

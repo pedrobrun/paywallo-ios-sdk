@@ -6,26 +6,26 @@ public final class PaywalloClient {
     // Subsystems
     private var config: PaywalloInitConfig?
     private var apiClient: ApiClient?
-    private var apiClientQueue: ApiClientQueue?
     private var identityManager = IdentityManager()
     private var sessionManager = SessionManager()
     private var sessionTracking: SessionTracking?
     private var sessionLifecycle: SessionLifecycle?
     private var eventBatcher = EventBatcher()
-    private var offlineQueue = OfflineQueue()
-    private var queueProcessor: QueueProcessor?
     private var subscriptionManager = SubscriptionManager()
     private var subscriptionCache = SubscriptionCache()
     private var onboardingManager = OnboardingManager()
     private var notificationsManager: NotificationsManager?
     private var networkMonitor = NetworkMonitor.shared
     private var advertisingIdManager = AdvertisingIdManager.shared
-    private var attributionTracker = AttributionTracker()
+    private var attributionTracker = AttributionTracker.shared
     private var deepLinkCapture: DeepLinkAttributionCapture?
     private var installTracker = InstallTracker()
     private var metaBridge = MetaBridge.shared
     private var autoEvents = AutoEvents()
     private var localization = Localization.shared
+    private var iapService: IAPService?
+    private var transactionEmitter: TransactionEmitter?
+    private let skanManager = SkanManager()
     private var campaignGateService: CampaignGateService?
     private var flagService: FlagService?
     private var planService: PlanService?
@@ -38,6 +38,7 @@ public final class PaywalloClient {
     private var pendingIdentifies: [IdentifyOptions] = []
     private var debug = false
     private var networkRecoveryCleanup: (() -> Void)?
+    private var attEnrichCleanup: (() -> Void)?
     // Pre-resolved session flag values (keyed by flag key).
     // Populated during init if config.sessionFlags is set; nil means not resolved.
     private var sessionFlagsMap: [String: String?] = [:]
@@ -122,6 +123,22 @@ public final class PaywalloClient {
         await tempApi.reportError(paywError)
     }
 
+    /// Single-owner rule: if another SDK in the same binary also writes the conversion value,
+    /// the two overwrite each other — it is a single, monotonic value per app. `skan: false`
+    /// hands ownership over.
+    private func setupSkan(_ config: PaywalloInitConfig) async {
+        if config.skan == false { return }
+        guard NativeSkan.isAvailable() else {
+            if debug { print("[Paywallo][SKAN] auto-detect: disabled — SKAdNetwork unavailable") }
+            return
+        }
+        await skanManager.injectDeps(debug: debug)
+        eventBatcher.setEventObserver { [weak self] name, props in
+            self?.skanManager.observe(name, properties: props)
+        }
+        skanManager.openConversionWindow()
+    }
+
     private func resolveSessionFlags(api: ApiClient, keys: [String]) async {
         do {
             let results = try await api.evaluateFlags(keys: keys, distinctId: identityManager.getDistinctId())
@@ -150,38 +167,40 @@ public final class PaywalloClient {
     private func doInit(_ config: PaywalloInitConfig) async throws {
         let environment = config.environment ?? (debug ? .sandbox : .production)
 
-        // 1. Network + OfflineQueue
+        // 1. Network. The durable offline queue was REMOVED in 2.7.0 (incident 03/08/2026);
+        // all that is left is a one-shot wipe of its three orphaned storage keys.
         networkMonitor.initialize()
         networkMonitor.setDebug(debug)
-        offlineQueue.initialize()
-        offlineQueue.clearItemsWithInvalidAppKey(config.appKey)
+        LegacyOfflineQueueCleanup.run()
 
-        // 2. ApiClient
-        let serverUrl = config.apiUrl ?? PaywalloConstants.defaultApiUrl
-        let api = ApiClient(serverUrl: serverUrl, appKey: config.appKey, debug: debug, environment: environment)
+        // 2. ApiClient. resolveApiUrl THROWS on a malformed or non-https override —
+        // silently falling back to production would point a local test build at real data.
+        let serverUrl = try ApiClient.resolveApiUrl(config.apiUrl)
+        let api = ApiClient(
+            serverUrl: serverUrl,
+            appKey: config.appKey,
+            debug: debug,
+            environment: environment,
+            timeout: config.timeout ?? PaywalloConstants.defaultTimeout
+        )
         if let onError = config.onError {
             api.onError = onError
         }
         self.apiClient = api
 
-        let queue = ApiClientQueue(
-            apiClient: api,
-            offlineQueue: offlineQueue,
-            networkMonitor: networkMonitor,
-            debug: debug
-        )
-        self.apiClientQueue = queue
-
-        // 3. QueueProcessor
-        let processor = QueueProcessor(queue: offlineQueue, networkMonitor: networkMonitor)
-        processor.initialize(httpClient: api.httpClient, getFreshHeaders: { [weak self] in
-            guard let self = self else { return [:] }
-            return [
-                "X-App-Key": config.appKey,
-                "x-sdk-version": PaywalloConstants.sdkVersion
-            ]
-        })
-        self.queueProcessor = processor
+        // 3. PendingRetry — durable retry for CRITICAL requests only. Re-posts each saved
+        // body byte-for-byte; it never merges, re-wraps or batches items (that re-wrap is
+        // exactly what lost 100% of $app_installed on 03/08/2026).
+        await PendingRetry.shared.setDebug(debug)
+        await PendingRetry.shared.initialize { url, body, headers in
+            do {
+                let options = RequestOptions(method: "POST", headers: headers, body: body, skipRetry: true)
+                let response = try await api.httpClient.requestRaw(path: url, options: options)
+                return (ok: response.ok, status: response.status)
+            } catch {
+                return (ok: false, status: 0)
+            }
+        }
 
         // 4. SubscriptionManager
         subscriptionManager.initialize(SubscriptionManagerConfig(
@@ -217,14 +236,31 @@ public final class PaywalloClient {
         await attributionTracker.loadFromStorage()
         deepLinkCapture = DeepLinkAttributionCapture(attributionTracker: attributionTracker)
         deepLinkCapture?.start()
+        // Deferred deep link resolved on a previous launch (screen personalisation only —
+        // it never enters an event envelope or the CAPI pipeline).
+        await DeferredDeepLinkStore.shared.loadFromStorage()
+        // Warms the attribution kill-switch cache. Deliberately NOT awaited: the read below
+        // is cache-only, and $app_installed must never wait on a round trip.
+        Task { await api.refreshAttributionFlags() }
 
-        // 8. Pre-warm DeviceInfo (BEFORE context provider so events have device data)
-        let _ = await DeviceInfo.shared.getDeviceInfo()
-
-        // 8b. Pre-warm ad IDs + Meta (fire-and-forget)
-        Task { await self.advertisingIdManager.collect(requestATT: config.requestATT ?? false) }
-        Task { let _ = await self.metaBridge.getAnonymousID() }
-        Task { let _ = await self.metaBridge.fetchDeferredAppLink(attributionTracker: self.attributionTracker) }
+        // 8. Pre-warm identity caches and AWAIT them, with a 350ms ceiling, so the first
+        // events of the session (cold_start, session_start) already carry idfv / idfa /
+        // fb_anon_id when the (synchronous) context provider runs. If a native call is slow
+        // the deadline wins and init continues — later events still pick the values up.
+        //
+        // The SDK NEVER shows the ATT prompt; the app does, before init. The timing of that
+        // prompt decides the opt-in rate and only the app knows the right moment — and the
+        // install must not block waiting for the answer (2.8.0).
+        await withDeadline(timeoutMs: 350) { [weak self] in
+            guard let self = self else { return }
+            async let device: Void = { _ = await DeviceInfo.shared.getDeviceInfo() }()
+            async let adIds: Void = { _ = await self.advertisingIdManager.collect() }()
+            async let anonId: Void = { _ = await self.metaBridge.getAnonymousID() }()
+            _ = await (device, adIds, anonId)
+        }
+        // The deferred app link is the iOS equivalent of the install referrer; it feeds the
+        // $app_installed payload, so it is fetched but never gates init.
+        Task { _ = await self.metaBridge.fetchDeferredAppLink(attributionTracker: self.attributionTracker) }
 
         // 9. Event context provider
         api.setEventContextProvider { [weak self] in
@@ -288,10 +324,11 @@ public final class PaywalloClient {
 
         // 11. Event pipeline
         eventBatcher.initialize(
-            httpClient: api.httpClient,
+            post: { url, body, label, priority in
+                await api.postWithQueue(url: url, payload: body, label: label, priority: priority)
+            },
             contextProvider: { api.getEventContext() },
-            offlineQueue: offlineQueue,
-            appKey: config.appKey,
+            distinctIdProvider: { [weak self] in self?.identityManager.getDistinctId() ?? "" },
             debug: debug
         )
 
@@ -329,11 +366,31 @@ public final class PaywalloClient {
         if config.notifications != false {
             let nm = NotificationsManager(
                 apiClient: api,
-                distinctIdProvider: { [weak self] in self?.identityManager.getDistinctId() ?? "" }
+                distinctIdProvider: { [weak self] in self?.identityManager.getDistinctId() ?? "" },
+                eventBatcher: eventBatcher,
+                deviceIdProvider: { [weak self] in self?.identityManager.getDeviceId() ?? "" }
             )
             notificationsManager = nm
-            await nm.initialize()
+            await nm.initialize(config: NotificationsConfig(debug: debug))
         }
+
+        // 13b. IAP — the Transaction.updates listener starts with the emitter. Without it
+        // `transaction {renewed}` never fires, which also makes the SKAN `Retained` milestone
+        // unreachable, and refunds/cancellations never reach the server.
+        let iap = IAPService(apiClient: api, debug: debug)
+        let emitter = TransactionEmitter(
+            batcher: eventBatcher,
+            productProvider: { [weak iap] id in iap?.getProduct(id) },
+            distinctIdProvider: { [weak self] in self?.identityManager.getDistinctId() },
+            debug: debug
+        )
+        iap.setTransactionEmitter(emitter)
+        self.iapService = iap
+        self.transactionEmitter = emitter
+
+        // 13c. SKAN — BEFORE the install tracker on purpose: opening the conversion window is
+        // a prerequisite for Apple to generate any postback for the installation at all.
+        await setupSkan(config)
 
         // 14. Auto start session
         if config.autoStartSession != false {
@@ -348,31 +405,58 @@ public final class PaywalloClient {
         // 14b. Warm device info so context provider + install tracker have cached data
         let deviceData = await DeviceInfo.shared.getDeviceInfo()
 
-        // 15. Install tracking + deferred match (fire-and-forget)
+        // 14c. Post-ATT enrichment producer. The install fires immediately without waiting
+        // for the prompt, so the IDFA only exists once the APP asks and the user accepts.
+        // Unsubscribe first: an init retry would otherwise register a second listener and
+        // post the enrichment twice.
+        attEnrichCleanup?()
+        attEnrichCleanup = advertisingIdManager.onGrantedTransition { [weak self] result in
+            guard let self = self, let idfa = result.idfa else { return }
+            let distinctId = self.identityManager.getDistinctId()
+            guard !distinctId.isEmpty else { return }
+            Task {
+                await api.enrichInstall(distinctId: distinctId, idfa: idfa, attStatus: result.attStatus.rawValue)
+            }
+        }
+
+        // 15. Install tracking (fire-and-forget). The deferred match now lives inside the
+        // tracker's InstallRetryScheduler: the old performDeferredMatch stamped
+        // `deferred_match_done` regardless of the outcome, so a device that did not match on
+        // the first try — common on iOS, where the click may not be processed yet or the IP
+        // changed between click and install — was sealed with no attribution forever.
         Task {
-            await self.installTracker.trackIfNeeded(
+            let referrer = await self.metaBridge.fetchDeferredAppLink(attributionTracker: self.attributionTracker)
+            let sent = await self.installTracker.trackIfNeeded(
+                apiClient: api,
                 distinctIdProvider: { [weak self] in self?.identityManager.getDistinctId() ?? "" },
                 sessionId: self.sessionManager.getSessionId(),
                 deviceData: deviceData,
                 advertisingIds: self.advertisingIdManager.getCached(),
-                attribution: self.attributionTracker.get(),
                 fbAnonymousId: self.metaBridge.getCachedAnonymousId(),
+                referrer: referrer,
+                idfvChanged: self.identityManager.hasIdfvChanged(),
+                // Cache miss means "no answer yet", not "disabled" — hence the true default.
+                syncedIdentityEnabled: api.getAttributionFlagsFromCache()?.syncedIdentityEnabled ?? true,
                 trackEvent: { [weak self] name, props, priority in
                     self?.eventBatcher.enqueue(name: name, properties: props, priority: priority)
-                },
-                appKey: config.appKey
+                }
             )
-
-            // Deferred match — direct attribution match endpoint (best-effort)
-            await self.installTracker.performDeferredMatch(
-                appKey: config.appKey,
-                httpClient: api.httpClient,
-                deviceData: deviceData,
-                advertisingIds: self.advertisingIdManager.getCached(),
-                fbAnonymousId: self.metaBridge.getCachedAnonymousId(),
-                attributionTracker: self.attributionTracker
-            )
+            if self.debug {
+                print(sent
+                    ? "[Paywallo INSTALL] $app_installed sent"
+                    : "[Paywallo INSTALL] $app_installed skipped — aparelho já rastreado ou sem distinctId")
+            }
         }
+
+        // 15b. Superwall bridge. Arms the pw_* attribute push and subscribes to
+        // attributionTracker.onCapture, so a deep link / deferred match that resolves after
+        // boot re-pushes (idempotent by signature).
+        startSuperwallBridge(
+            attribution: attributionTracker,
+            distinctIdProvider: { [weak self] in self?.identityManager.getDistinctId() ?? "" },
+            apiClient: api,
+            debug: debug
+        )
 
         // 16. Auto events (fire-and-forget)
         Task {
@@ -478,73 +562,111 @@ public final class PaywalloClient {
         }
         await identityManager.identify(options)
 
-        // Send to server via queue (durable — survives offline)
-        if let queue = apiClientQueue {
-            let distinctId = identityManager.getDistinctId()
-            let properties = options.properties
-            let email = options.email
-            let deviceId = identityManager.getDeviceId()
-            let pii: [String: String?] = [
+        // Body is built in ONE place (ApiClient.identify) — this used to be a duplicated
+        // copy that had already drifted from it. identify is `critical`: it carries the PII
+        // and the attribution signals (fbclid/utm/gclid) used for matching, so a network
+        // blip must not drop it — a failure lands in PendingRetry.
+        guard let api = apiClient else { return }
+        await api.identify(
+            identityManager.getDistinctId(),
+            properties: options.properties,
+            email: options.email,
+            deviceId: identityManager.getDeviceId(),
+            pii: [
                 "phone": options.phone,
                 "firstName": options.firstName,
                 "lastName": options.lastName,
                 "dateOfBirth": options.dateOfBirth,
                 "gender": options.gender?.rawValue,
+                "zipCode": options.zipCode,
             ]
-
-            // Build body identical to ApiClient.identify()
-            var traits: [String: Any] = ["platform": "ios"]
-            if let email = email { traits["email"] = email }
-
-            let traitKeys: Set<String> = ["name", "country", "locale", "app_version"]
-            let attributionKeys: Set<String> = [
-                "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term",
-                "fbclid", "gclid", "ttclid", "referrer",
-            ]
-            var attribution: [String: Any] = [:]
-            if let props = properties {
-                for (k, v) in props {
-                    if traitKeys.contains(k) { traits[k] = v.value }
-                    else if attributionKeys.contains(k) { attribution[k] = v.value }
-                }
-            }
-            for (k, v) in pii {
-                guard let v = v else { continue }
-                if k == "email" { traits["email"] = v }
-                else if traitKeys.contains(k) { traits[k] = v }
-            }
-
-            var body: [String: Any] = ["distinct_id": distinctId, "traits": traits]
-            if !attribution.isEmpty { body["attribution"] = attribution }
-            if let deviceId = deviceId, !deviceId.isEmpty { body["deviceId"] = deviceId }
-
-            if let phone = pii["phone"] as? String, !phone.isEmpty {
-                body["phone"] = phone
-            }
-            if let firstName = pii["firstName"] as? String, !firstName.isEmpty {
-                body["firstName"] = firstName
-            }
-            if let lastName = pii["lastName"] as? String, !lastName.isEmpty {
-                body["lastName"] = lastName
-            }
-            if let dob = pii["dateOfBirth"] as? String, ApiClient.isValidDateOfBirth(dob) {
-                body["dateOfBirth"] = dob
-            }
-            if let rawGender = pii["gender"] as? String, let g = ApiClient.normalizeGender(rawGender) {
-                body["gender"] = g
-            }
-
-            let jsonData = try? JSONSerialization.data(withJSONObject: body)
-            Task {
-                await queue.execute(method: "POST", path: "/sdk/identity/identify", body: jsonData, priority: .normal)
-            }
-        }
+        )
     }
 
     public func getDistinctId() -> String { identityManager.getDistinctId() }
     public func getDeviceId() -> String? { identityManager.getDeviceId() }
     public func getEmail() -> String? { identityManager.getEmail() }
     public func getIdentityState() -> IdentityState { identityManager.getState() }
+
+    /// Pushes the `pw_*` attributes to Superwall and waits, up to `timeoutMs`, for them to land.
+    ///
+    /// Call this immediately before every `register()`. Superwall evaluates audience rules
+    /// on-device inside `register()`, and the variant chosen there sticks to the user until the
+    /// assignment is reset — an attribute that arrives afterwards reclassifies nobody. Since
+    /// Paywallo's attribution resolves seconds after first open (deferred match), skipping this
+    /// leaves ad-sourced users permanently evaluated as organic.
+    ///
+    /// `timeoutMs` is a total deadline, not a fixed split: whatever the server lookup does not
+    /// use is handed to the push.
+    @discardableResult
+    public func syncSuperwallAttributes(
+        timeoutMs: Int = PaywalloConstants.defaultSyncTimeoutMs
+    ) async -> SuperwallSyncOutcome {
+        await PaywalloSDK.syncSuperwallAttributes(timeoutMs: timeoutMs, debug: debug)
+    }
+
+    /// Public stable identifier — wraps `getDistinctId()`. Established automatically on boot.
+    public func getId() -> String { identityManager.getDistinctId() }
+
+    /// Merges into the stored user properties and re-sends `identify` with the accumulated set.
+    public func updateProperties(_ properties: [String: AnyCodable]) async {
+        await identityManager.updateProperties(properties)
+    }
+
+    /// LGPD/GDPR erase. Signals the server, then wipes local PII and any pending retries
+    /// (they can carry PII) and issues a fresh anonymous id **immediately** — a running app
+    /// must never be left tracking with a nil distinctId. `deviceId` is deliberately kept:
+    /// it feeds install idempotency, so clearing it would let the device re-register as new.
+    public func deleteUserData() async {
+        let distinctId = identityManager.getDistinctId()
+        let deviceId = identityManager.getDeviceId()
+        if let api = apiClient, !distinctId.isEmpty {
+            await api.deleteUserData(distinctId: distinctId, deviceId: deviceId)
+        }
+        await identityManager.deleteUserData()
+    }
+
+    /// The deferred deep link resolved by the attribution match, when the user came from an
+    /// ad for a specific offer. Personalisation data only — it never enters an event.
+    public func getDeferredDeepLink() -> DeferredDeepLink? {
+        DeferredDeepLinkStore.shared.get()
+    }
+
+    /// Observes the deferred deep link, which usually resolves in the background *after* the
+    /// UI has already mounted. Returns an unsubscribe closure.
+    @discardableResult
+    public func onDeferredDeepLink(_ listener: @escaping (DeferredDeepLink) -> Void) -> () -> Void {
+        DeferredDeepLinkStore.shared.onCapture(listener)
+    }
+
+    /// DEV ONLY. Wipes the install markers so the next cold start looks like a new user.
+    ///
+    /// Needed because these keys live in the Keychain: they survive deleting the app and come
+    /// back from an iCloud restore, so a device that ran the app once can never test the
+    /// acquisition flow again. Requires a restart — the next cold start is what emits
+    /// `$app_installed`.
+    ///
+    /// Two guards: it does not exist in a release build (`#if DEBUG`, so the call cannot even
+    /// be compiled into a shipped binary), and it throws unless `debug: true`. Never call it in
+    /// production: besides inflating install counts it resets the anonymous identity and
+    /// erases local PII.
+    public func devResetInstallState() async throws {
+        #if DEBUG
+        guard config?.debug == true else {
+            throw ClientError(
+                code: ClientErrorCode.notInitialized,
+                message: "devResetInstallState exige debug: true"
+            )
+        }
+        await identityManager.clearInstallStateForDev()
+        print("[Paywallo DEV] estado de install limpo — reinicie o app para disparar $app_installed")
+        #else
+        throw ClientError(
+            code: ClientErrorCode.notInitialized,
+            message: "devResetInstallState não existe em build de produção"
+        )
+        #endif
+    }
 
     // MARK: - Events
 
@@ -697,19 +819,34 @@ public final class PaywalloClient {
         guard let gate = campaignGateService else {
             return CampaignResult(presented: false, purchased: false, cancelled: false, restored: false)
         }
-        let response = await gate.presentCampaign(
+        // "No campaign for this placement" and "active subscriber" are DIFFERENT outcomes.
+        // Both used to collapse into nil here and get reported as skippedReason "subscriber",
+        // which made a missing campaign look like a paying user in the caller's analytics.
+        let outcome = await gate.resolveCampaign(
             placement: placement,
             distinctId: identityManager.getDistinctId(),
             context: context,
             forceShow: forceShow
         )
-        guard let response = response else {
+        let response: CampaignResponse
+        switch outcome {
+        case .campaign(let value):
+            response = value
+        case .subscriber:
             return CampaignResult(
                 presented: false,
                 purchased: false,
                 cancelled: false,
                 restored: false,
                 skippedReason: "subscriber"
+            )
+        case .notFound(let error):
+            return CampaignResult(
+                presented: false,
+                purchased: false,
+                cancelled: false,
+                restored: false,
+                error: error
             )
         }
         guard let presenter = campaignPresenter else {
@@ -804,16 +941,21 @@ public final class PaywalloClient {
         return autoPreloadPlacement
     }
 
-    // MARK: - Queue Management
+    // MARK: - Queue Management (removed in 2.9.0 — kept as no-ops for source compatibility)
 
-    public func getOfflineQueueSize() -> Int { offlineQueue.count }
-    public func clearOfflineQueue() async { offlineQueue.clear() }
+    /// - Warning: The durable offline queue was removed (incident 03/08/2026). Always 0.
+    @available(*, deprecated, message: "Fila offline removida em 2.9.0; no-op, sai na 3.0.0.")
+    public func getOfflineQueueSize() -> Int { 0 }
 
-    /// Processes the offline queue and returns the count of processed and failed items.
-    /// Mirrors RN `processOfflineQueue() → { processed: number; failed: number }`.
+    /// - Warning: No-op. Clears the durable critical-retry store instead.
+    @available(*, deprecated, message: "Fila offline removida em 2.9.0; limpa o PendingRetry, sai na 3.0.0.")
+    public func clearOfflineQueue() async { await PendingRetry.shared.clear() }
+
+    /// - Warning: No-op. `PendingRetry` drains itself on a 30s timer and on network recovery.
+    @available(*, deprecated, message: "Fila offline removida em 2.9.0; no-op, sai na 3.0.0.")
     @discardableResult
     public func processOfflineQueue() async -> OfflineQueueResult {
-        return await queueProcessor?.processQueue() ?? OfflineQueueResult(processed: 0, failed: 0)
+        OfflineQueueResult(processed: 0, failed: 0)
     }
 
     // MARK: - Plans
@@ -913,8 +1055,47 @@ public final class PaywalloClient {
     /// - Parameter provisional: If true, requests provisional (quiet) authorization — iOS 12+.
     public func requestPushPermission(provisional: Bool = false) async -> PushPermissionStatus {
         guard isReadyFlag, let nm = notificationsManager else { return .notDetermined }
-        let granted = await nm.requestPermission(provisional: provisional)
-        return granted ? .granted : .denied
+        return await nm.requestPushPermission(provisional: provisional)
+    }
+
+    /// Current OS push permission, without prompting.
+    public func getPushPermissionStatus() async -> PushPermissionStatus {
+        guard let nm = notificationsManager else { return .notDetermined }
+        return await nm.getPermissionStatus()
+    }
+
+    /// Soft prompt: the SDK never renders UI — it hands back the copy plus `accept()` /
+    /// `reject()`, so the app owns the presentation and the SDK owns the funnel events.
+    public func requestPushPermissionWithPrePrompt(_ options: PrePromptOptions) -> PrePromptHandle? {
+        notificationsManager?.requestPermissionWithPrePrompt(options)
+    }
+
+    /// Callbacks accumulate — registering a second one does not replace the first.
+    public func onNotificationReceived(_ callback: @escaping (NotificationPayload) -> Void) {
+        notificationsManager?.onReceived(callback)
+    }
+
+    public func onNotificationOpened(_ callback: @escaping (NotificationPayload) -> Void) {
+        notificationsManager?.onOpened(callback)
+    }
+
+    public func onNotificationDismissed(_ callback: @escaping (NotificationPayload) -> Void) {
+        notificationsManager?.onDismissed(callback)
+    }
+
+    /// The notification that launched the app, if any.
+    public func getInitialNotification() -> NotificationPayload? {
+        notificationsManager?.getInitialNotification()
+    }
+
+    /// Call from `application(_:didFinishLaunchingWithOptions:)` with the remote-notification
+    /// launch option so a cold start from a push is attributed.
+    public func setInitialNotification(userInfo: [AnyHashable: Any]) {
+        notificationsManager?.setInitialNotification(userInfo: userInfo)
+    }
+
+    public func flushNotificationEvents() async {
+        await notificationsManager?.flushEvents()
     }
 
     /// Forwards the APNS device token to the notifications subsystem.
@@ -967,9 +1148,10 @@ public final class PaywalloClient {
         sessionTracking = nil
         await identityManager.reset()
         await subscriptionCache.invalidateAll()
-        queueProcessor?.dispose()
-        queueProcessor = nil
-        offlineQueue.dispose()
+        await PendingRetry.shared.dispose()
+        stopSuperwallBridge()
+        attEnrichCleanup?()
+        attEnrichCleanup = nil
         networkMonitor.dispose()
         campaignGateService?.invalidateAllCache()
         campaignGateService = nil
@@ -999,7 +1181,6 @@ public final class PaywalloClient {
 
         eventBatcher.dispose()
         apiClient = nil
-        apiClientQueue = nil
         config = nil
         isReadyFlag = false
         initTask = nil

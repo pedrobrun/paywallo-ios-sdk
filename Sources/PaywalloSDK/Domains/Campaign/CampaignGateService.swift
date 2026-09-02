@@ -1,8 +1,9 @@
 import Foundation
 
-/// In-memory preload entry for a campaign placement.
+/// In-memory preload entry for a campaign placement. Só existe entrada para resposta
+/// de verdade — erro nunca vira cache.
 private struct PreloadEntry {
-    let response: CampaignResponse?
+    let response: CampaignResponse
     let storedAt: Date
     let ttl: TimeInterval
 
@@ -14,6 +15,18 @@ private struct PreloadEntry {
     var isStale: Bool {
         Date().timeIntervalSince(storedAt) >= ttl * 0.8
     }
+}
+
+/// Resultado da resolução de uma campanha para apresentação.
+///
+/// "Não existe campanha nesse placement" e "o usuário já é assinante" são coisas
+/// diferentes: colapsar as duas em `nil` fazia o client rotular toda falha de
+/// configuração como `skippedReason: "subscriber"`, e o app nunca ficava sabendo que
+/// o placement estava errado.
+public enum CampaignGateOutcome {
+    case campaign(CampaignResponse)
+    case notFound(CampaignError)
+    case subscriber
 }
 
 public final class CampaignGateService: @unchecked Sendable {
@@ -104,58 +117,85 @@ public final class CampaignGateService: @unchecked Sendable {
 
     // MARK: - Wait for preload
 
-    /// Polls until preload completes or timeout (2s). Falls back to nil.
+    /// Espera um preload EM VOO para o placement terminar (teto de 2s) e devolve o que
+    /// ficou em cache.
+    ///
+    /// Sem preload em voo, retorna na hora: o loop dormia os 2s inteiros em todo
+    /// caminho frio, e como `presentCampaign` e `isPreloaded` chamam isto antes do
+    /// fetch, cada apresentação fria pagava 2s de latência para não descobrir nada.
     public func waitForPreload(_ placement: String) async -> CampaignResponse? {
+        guard getActivePromise(placement) != nil else {
+            return getCached(placement)?.response
+        }
+
         let deadline = Date().addingTimeInterval(waitMaxDuration)
-
         while Date() < deadline {
-            if let cached = getCached(placement) {
-                return cached.response
-            }
-
-            // Check if there's an active preload in flight
-            if let promise = getActivePromise(placement) {
-                return await promise.value
-            }
-
+            if getActivePromise(placement) == nil { break }
             try? await Task.sleep(nanoseconds: UInt64(waitPollInterval * 1_000_000_000))
         }
 
-        // Return whatever is cached (even stale) after timeout
+        // Devolve o que ficou em cache — inclusive stale — mesmo se estourou o teto.
         return getCached(placement)?.response
     }
 
     // MARK: - Present campaign
 
-    /// Returns campaign for presentation.
-    /// - forceShow: skip subscription check, present regardless of active status.
-    /// - Returns nil when paywall is null or subscription gate blocks presentation.
+    /// Resolve a campanha para apresentação, distinguindo "não existe" de "assinante".
+    /// - forceShow: pula a checagem de assinatura, apresenta independente do status.
+    ///
+    /// A campanha é resolvida ANTES da checagem de assinatura: invertido, um placement
+    /// inexistente respondia "subscriber" para todo assinante e o erro de configuração
+    /// só aparecia para quem não assinava.
+    public func resolveCampaign(
+        placement: String,
+        distinctId: String?,
+        context: [String: AnyCodable]? = nil,
+        forceShow: Bool = false
+    ) async -> CampaignGateOutcome {
+        // Espera um preload em voo (retorna na hora se não houver) antes de olhar o cache.
+        _ = await waitForPreload(placement)
+
+        var resolved: CampaignResponse?
+        if let cached = getCached(placement), !cached.isExpired {
+            if cached.isStale {
+                Task { await self.fetchAndCache(placement, distinctId: distinctId, context: context) }
+            }
+            resolved = cached.response
+        } else {
+            resolved = await fetchAndCache(placement, distinctId: distinctId, context: context)
+        }
+
+        guard let campaign = resolved else {
+            return .notFound(CampaignError(
+                code: CampaignErrorCode.notFound,
+                message: "No campaign found for placement: \(placement)"
+            ))
+        }
+
+        if !forceShow {
+            let hasActive = await subscriptionManager.hasActiveSubscription()
+            if hasActive { return .subscriber }
+        }
+
+        return .campaign(campaign)
+    }
+
+    /// Atalho legado: descarta a distinção entre "não encontrada" e "assinante".
+    /// Prefira `resolveCampaign` — é ela que carrega o motivo.
     public func presentCampaign(
         placement: String,
         distinctId: String?,
         context: [String: AnyCodable]? = nil,
         forceShow: Bool = false
     ) async -> CampaignResponse? {
-        if !forceShow {
-            let hasActive = await subscriptionManager.hasActiveSubscription()
-            if hasActive { return nil }
-        }
-
-        // Try preload cache first
-        if let cached = getCached(placement), !cached.isExpired {
-            if cached.isStale {
-                Task { await self.fetchAndCache(placement, distinctId: distinctId, context: context) }
-            }
-            return cached.response
-        }
-
-        // Wait for in-flight preload, then fetch fresh if nothing cached
-        let fromPreload = await waitForPreload(placement)
-        if let result = fromPreload {
-            return result
-        }
-
-        return await fetchAndCache(placement, distinctId: distinctId, context: context)
+        let outcome = await resolveCampaign(
+            placement: placement,
+            distinctId: distinctId,
+            context: context,
+            forceShow: forceShow
+        )
+        guard case .campaign(let campaign) = outcome else { return nil }
+        return campaign
     }
 
     // MARK: - Cache invalidation
@@ -186,9 +226,8 @@ public final class CampaignGateService: @unchecked Sendable {
             setCache(placement, entry: entry)
             return response
         } catch {
-            // Cache a nil tombstone so repeated fails don't hammer the server
-            let entry = PreloadEntry(response: nil, storedAt: Date(), ttl: preloadTTL)
-            setCache(placement, entry: entry)
+            // Falha de rede não é resultado: gravar um tombstone com o TTL cheio fazia
+            // um erro transitório bloquear a campanha pelos 5 minutos seguintes.
             return nil
         }
     }

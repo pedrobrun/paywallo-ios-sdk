@@ -93,11 +93,14 @@ final class PaywalloClientTests: XCTestCase {
         XCTAssertNil(PaywalloClient.shared.getConfig())
     }
 
-    // MARK: - isOnline returns true (optimistic) before init
+    // MARK: - isOnline is pessimistic before init
 
-    func testIsOnline_beforeInit_returnsTrue() {
-        // NetworkMonitor returns true (optimistic) when not initialized
-        XCTAssertTrue(PaywalloClient.shared.isOnline())
+    func testIsOnline_beforeInit_returnsFalse() {
+        // Pessimistic on purpose (2.9.0): an uninitialised monitor reports offline so
+        // PendingRetry waits for a real "online" signal instead of burning its two attempts
+        // on a connection that was never confirmed — offline, that spent the critical
+        // event's whole retry budget in ~6 minutes and lost it before the network returned.
+        XCTAssertFalse(PaywalloClient.shared.isOnline())
     }
 
     // MARK: - getSessionId returns nil before init

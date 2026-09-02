@@ -31,7 +31,7 @@ public enum NotificationType: String, Codable, Sendable {
 }
 
 public enum OnboardingType: String, Codable, Sendable {
-    case step, complete, drop
+    case step, complete
 }
 
 public enum CloseReason: String, Codable, Sendable {
@@ -82,15 +82,41 @@ public enum EventFamilies {
     }
 
     /// Validate event properties against family schema (warn-only)
+    ///
+    /// Light manual shape check, not a mirror of the server's strict schema. It exists to
+    /// give a clear debug-build signal when the integrator sends something obviously wrong
+    /// (missing id, unknown type). The real validation runs server-side, and the event flows
+    /// either way so production analytics never go silent.
     public static func validateEvent(
         eventName: String,
         properties: [String: Any]?,
         debug: Bool = false
     ) -> (ok: Bool, family: EventFamily) {
         let family = detectFamily(eventName)
+        let props = properties ?? [:]
 
-        guard let props = properties, !props.isEmpty else {
-            return (true, family)
+        // Required identifiers, checked even when the payload is empty: these are the fields
+        // whose absence makes the server reject the whole envelope.
+        switch family {
+        case .identify:
+            let distinctId = props["distinct_id"] as? String
+            if distinctId?.isEmpty != false {
+                if debug { print("[Paywallo:Events] identify requires a non-empty \"distinct_id\"") }
+                return (false, family)
+            }
+        case .paywall:
+            let paywallId = props["paywall_id"] as? String
+            if paywallId?.isEmpty != false {
+                if debug { print("[Paywallo:Events] paywall requires a non-empty \"paywall_id\"") }
+                return (false, family)
+            }
+        case .transaction:
+            if props["transaction_id"] as? String == nil, props["tx_id"] as? String == nil {
+                if debug { print("[Paywallo:Events] transaction requires \"transaction_id\" (or legacy \"tx_id\")") }
+                return (false, family)
+            }
+        case .lifecycle, .onboarding, .notification, .custom:
+            break
         }
 
         // For canonical families, check that 'type' field matches allowed values

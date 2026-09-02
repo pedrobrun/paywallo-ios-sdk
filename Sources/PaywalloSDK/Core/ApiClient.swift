@@ -11,22 +11,54 @@ public final class ApiClient {
     public let appKey: String
     private var environment: Environment
     private var debug: Bool
+    /// Backs the cache-only reads that must never trigger a round trip (attribution flags).
+    private let cache = ApiCache()
     private var eventContextProvider: (() -> IngestContext)?
     private var distinctIdProvider: (() -> String)?
     public var onError: ((PaywalloError) -> Void)?
 
-    public init(serverUrl: String, appKey: String, debug: Bool = false, environment: Environment = .production) {
+    /// Resolves the API base URL from `config.apiUrl`, validating the format. Returns the
+    /// default when there is no override, and THROWS on a malformed one — a typo silently
+    /// falling back to production is how a device test ends up writing real events.
+    public static func resolveApiUrl(_ overrideUrl: String?) throws -> String {
+        guard let overrideUrl = overrideUrl, !overrideUrl.isEmpty else {
+            return PaywalloConstants.defaultApiUrl
+        }
+
+        guard let parsed = URL(string: overrideUrl), let scheme = parsed.scheme else {
+            throw ClientError(
+                code: ClientErrorCode.invalidApiUrl,
+                message: "config.apiUrl is not a valid URL: \"\(overrideUrl)\""
+            )
+        }
+
+        let host = parsed.host ?? ""
+        let isHttps = scheme == "https"
+        let isLocalHttp = scheme == "http"
+            && host.range(of: #"^(localhost|127\.0\.0\.1|192\.168\.\d{1,3}\.\d{1,3})$"#, options: .regularExpression) != nil
+        guard isHttps || isLocalHttp else {
+            throw ClientError(
+                code: ClientErrorCode.invalidApiUrl,
+                message: "config.apiUrl must be https, or http on localhost/192.168.x for local dev: \"\(overrideUrl)\""
+            )
+        }
+
+        return overrideUrl
+    }
+
+    public init(
+        serverUrl: String,
+        appKey: String,
+        debug: Bool = false,
+        environment: Environment = .production,
+        timeout: TimeInterval = PaywalloConstants.defaultTimeout
+    ) {
         self.appKey = appKey
         self.debug = debug
         self.environment = environment
-        self.httpClient = HttpClient(baseUrl: serverUrl, debug: debug)
+        self.httpClient = HttpClient(baseUrl: serverUrl, timeout: timeout, debug: debug)
 
-        httpClient.setGlobalHeaders([
-            "X-App-Key": appKey,
-            "x-sdk-version": PaywalloConstants.sdkVersion,
-            "x-sdk-platform": PaywalloConstants.sdkPlatform,
-            "x-sdk-environment": environment.rawValue,
-        ])
+        httpClient.setGlobalHeaders(Self.buildSdkHeaders(appKey: appKey, environment: environment))
     }
 
     /// Initializer for testing: accepts a pre-built HttpClient (e.g. backed by a mock URLSession).
@@ -36,12 +68,83 @@ public final class ApiClient {
         self.environment = environment
         self.httpClient = httpClient
 
-        httpClient.setGlobalHeaders([
+        httpClient.setGlobalHeaders(Self.buildSdkHeaders(appKey: appKey, environment: environment))
+    }
+
+    /// Baseline telemetry headers carried by every outgoing request. The User-Agent goes out
+    /// twice on purpose: `User-Agent` is what ua-parser-js reads server-side, and
+    /// `x-sdk-user-agent` survives the proxies and CDNs that rewrite the standard header.
+    private static func buildSdkHeaders(appKey: String, environment: Environment) -> [String: String] {
+        let userAgent = buildUserAgent(sdkVersion: PaywalloConstants.sdkVersion)
+        return [
             "X-App-Key": appKey,
             "x-sdk-version": PaywalloConstants.sdkVersion,
             "x-sdk-platform": PaywalloConstants.sdkPlatform,
             "x-sdk-environment": environment.rawValue,
-        ])
+            "User-Agent": userAgent,
+            "x-sdk-user-agent": userAgent,
+        ]
+    }
+
+    // MARK: - Request primitives
+
+    /// Fires `config.onError` without a real exception — used by callers outside ApiClient
+    /// (e.g. an event dropped for lack of a distinctId).
+    public func notifyError(_ error: Error) {
+        guard let onError = onError else { return }
+        onError(error as? PaywalloError
+            ?? ClientError(code: ClientErrorCode.unknown, message: error.localizedDescription))
+    }
+
+    public func get<T: Decodable>(path: String, options: RequestOptions? = nil) async throws -> HttpResponse<T> {
+        do {
+            return try await httpClient.get(path: path, options: options)
+        } catch {
+            notifyError(error)
+            throw error
+        }
+    }
+
+    public func post(path: String, body: Data, skipRetry: Bool = false) async throws -> HttpResponse<Data> {
+        do {
+            let options = RequestOptions(method: "POST", body: body, skipRetry: skipRetry)
+            return try await httpClient.requestRaw(path: path, options: options)
+        } catch {
+            notifyError(error)
+            throw error
+        }
+    }
+
+    /// Single entry point for the retry policy + durable retry of critical requests.
+    /// `payload` is the FINAL encoded body: it is what `PendingRetry` persists and what it
+    /// re-posts byte-for-byte, so nothing downstream may rebuild or re-wrap it.
+    public func postWithQueue(
+        url: String,
+        payload: Data,
+        label: String,
+        priority: EventPriority = .normal
+    ) async {
+        await PaywalloSDK.postWithQueue(
+            deps: queueDeps(),
+            url: url,
+            payload: payload,
+            label: label,
+            priority: priority
+        )
+    }
+
+    private func queueDeps() -> QueueDeps {
+        QueueDeps(
+            getAppKey: { [appKey] in appKey },
+            isDebug: { [weak self] in self?.debug ?? false },
+            post: { [weak self] path, body, skipRetry in
+                guard let self = self else {
+                    throw ClientError(code: ClientErrorCode.notInitialized, message: "ApiClient released")
+                }
+                return try await self.post(path: path, body: body, skipRetry: skipRetry)
+            },
+            onError: { [weak self] error in self?.notifyError(error) }
+        )
     }
 
     public func setDistinctIdProvider(_ provider: @escaping () -> String) {
@@ -91,6 +194,28 @@ public final class ApiClient {
         return PaywalloConstants.defaultWebUrl
     }
 
+    // MARK: - Attribution Flags
+
+    private static let attributionFlagsCacheKey = "attribution_flags"
+
+    /// Cache-only read: `$app_installed` must NEVER wait for a round trip. A cache miss means
+    /// "no answer yet", not "disabled", so the caller falls back to enabled.
+    public func getAttributionFlagsFromCache() -> AttributionFlags? {
+        cache.get(Self.attributionFlagsCacheKey)
+    }
+
+    /// Warms the cache for the next read — never awaited from an event-critical path.
+    public func refreshAttributionFlags() async {
+        struct Envelope: Decodable { let data: AttributionFlags }
+        do {
+            let response: HttpResponse<Envelope> = try await httpClient.get(path: "/sdk/flags")
+            guard response.ok else { return }
+            cache.set(Self.attributionFlagsCacheKey, value: response.data.data)
+        } catch {
+            // best-effort — callers fall back to their own default on a cache miss
+        }
+    }
+
     // MARK: - Identity
 
     public func identify(_ distinctId: String, properties: [String: AnyCodable]?, email: String?, deviceId: String?, pii: [String: String?]? = nil) async {
@@ -125,29 +250,53 @@ public final class ApiClient {
         if let deviceId = deviceId, !deviceId.isEmpty { body["deviceId"] = deviceId }
 
         // PII fields sent top-level (matches RN SDK buildPiiPayload)
-        if let pii = pii {
-            if let phone = pii["phone"] as? String, !phone.isEmpty {
-                body["phone"] = phone
-            }
-            if let firstName = pii["firstName"] as? String, !firstName.isEmpty {
-                body["firstName"] = firstName
-            }
-            if let lastName = pii["lastName"] as? String, !lastName.isEmpty {
-                body["lastName"] = lastName
-            }
-            if let dob = pii["dateOfBirth"] as? String, ApiClient.isValidDateOfBirth(dob) {
-                body["dateOfBirth"] = dob
-            }
-            if let rawGender = pii["gender"] as? String, let g = ApiClient.normalizeGender(rawGender) {
-                body["gender"] = g
-            }
+        func piiValue(_ key: String) -> String? {
+            guard let outer = pii?[key], let value = outer, !value.isEmpty else { return nil }
+            return value
+        }
+        if let phone = piiValue("phone") { body["phone"] = phone }
+        if let firstName = piiValue("firstName") { body["firstName"] = firstName }
+        if let lastName = piiValue("lastName") { body["lastName"] = lastName }
+        if let dob = ApiClient.normalizeDateOfBirth(piiValue("dateOfBirth")) { body["dateOfBirth"] = dob }
+        if let gender = ApiClient.normalizeGender(piiValue("gender") ?? "") { body["gender"] = gender }
+        if let zipCode = piiValue("zipCode")?.trimmingCharacters(in: .whitespacesAndNewlines), !zipCode.isEmpty {
+            body["zipCode"] = zipCode
         }
 
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return }
+        // critical: identify carries PII plus the attribution signals (fbclid/utm/gclid) used
+        // for matching — losing it on a network blip degrades attribution. A failure lands in
+        // PendingRetry (durable).
+        await postWithQueue(url: "/sdk/identity/identify", payload: jsonData, label: "identify", priority: .critical)
+    }
+
+    /// LGPD/GDPR erase signal — tells the server the local identity was wiped so downstream
+    /// systems (CRM exports, CAPI/TikTok payloads) stop using it. critical: durable retry on
+    /// 5xx/429/network failure, same as `identify()`.
+    public func deleteUserData(distinctId: String, deviceId: String? = nil) async {
+        var body: [String: Any] = ["distinct_id": distinctId]
+        if let deviceId = deviceId, !deviceId.isEmpty { body["deviceId"] = deviceId }
+
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return }
+        await postWithQueue(url: "/sdk/identity/delete", payload: jsonData, label: "delete_user_data", priority: .critical)
+    }
+
+    /// Post-ATT enrichment: the install fires immediately without waiting for the prompt, so
+    /// the IDFA only exists after the app asks and the user accepts. Without this POST the
+    /// server holds the dispatch until the deadline and sends the install with no madid.
+    ///
+    /// ATT is granted once: a network failure at this exact moment loses the IDFA for good —
+    /// iOS's strongest identifier for CAPI — so the request is persisted for retry.
+    public func enrichInstall(distinctId: String, idfa: String, attStatus: String) async {
+        let body: [String: Any] = ["distinctId": distinctId, "idfa": idfa, "attStatus": attStatus]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else { return }
+
+        let path = "/sdk/attribution/install-enrich/\(appKey)"
         do {
-            let jsonData = try JSONSerialization.data(withJSONObject: body)
-            let options = RequestOptions(method: "POST", body: jsonData, skipRetry: true)
-            let _ = try await httpClient.requestRaw(path: "/sdk/identity/identify", options: options)
-        } catch { /* non-critical */ }
+            _ = try await post(path: path, body: jsonData)
+        } catch {
+            await PendingRetry.shared.save(url: path, body: jsonData, headers: ["X-App-Key": appKey])
+        }
     }
 
     /// Validates dateOfBirth is in YYYY-MM-DD format.
@@ -155,6 +304,30 @@ public final class ApiClient {
         let pattern = #"^\d{4}-\d{2}-\d{2}$"#
         guard let _ = dob.range(of: pattern, options: .regularExpression) else { return false }
         return true
+    }
+
+    /// Accepts `YYYY-MM-DD` as-is and converts anything else the platform can parse. A value
+    /// with a time component is read in UTC (it came from a timestamp); one without is read
+    /// locally, so a date the user typed does not shift a day backwards west of Greenwich.
+    static func normalizeDateOfBirth(_ raw: String?) -> String? {
+        guard let raw = raw, !raw.isEmpty else { return nil }
+        if isValidDateOfBirth(raw) { return raw }
+
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var parsed = iso.date(from: raw)
+        if parsed == nil {
+            iso.formatOptions = [.withInternetDateTime]
+            parsed = iso.date(from: raw)
+        }
+        guard let date = parsed else { return nil }
+
+        let hasTimeComponent = raw.contains("T") || raw.contains("Z")
+        var calendar = Calendar(identifier: .gregorian)
+        if hasTimeComponent { calendar.timeZone = TimeZone(identifier: "UTC") ?? .current }
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        guard let year = components.year, let month = components.month, let day = components.day else { return nil }
+        return String(format: "%04d-%02d-%02d", year, month, day)
     }
 
     /// Normalizes gender to "m" or "f". Returns nil for unrecognized values.
@@ -190,7 +363,7 @@ public final class ApiClient {
     // MARK: - Paywall
 
     public func getPaywall(_ placement: String) async throws -> PaywallConfig {
-        let response: HttpResponse<PaywallConfig> = try await httpClient.get(path: "/sdk/paywalls/\(placement)")
+        let response: HttpResponse<PaywallConfig> = try await get(path: "/sdk/paywalls/\(placement)")
         return response.data
     }
 
@@ -219,7 +392,7 @@ public final class ApiClient {
         }
         path += "?" + queryItems.joined(separator: "&")
 
-        let response: HttpResponse<CampaignResponse> = try await httpClient.get(path: path)
+        let response: HttpResponse<CampaignResponse> = try await get(path: path)
         return response.data
     }
 
@@ -228,7 +401,7 @@ public final class ApiClient {
         struct PlacementsResponse: Decodable {
             let data: [String]
         }
-        let response: HttpResponse<PlacementsResponse> = try await httpClient.get(path: "/sdk/campaigns/placements")
+        let response: HttpResponse<PlacementsResponse> = try await get(path: "/sdk/campaigns/placements")
         return response.data.data
     }
 
@@ -236,7 +409,7 @@ public final class ApiClient {
         guard let resolvedId = resolveDistinctId(distinctId) else { return nil }
         let encoded = resolvedId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? resolvedId
         let path = "/campaigns/public/primary?distinctId=\(encoded)"
-        let response: HttpResponse<CampaignResponse> = try await httpClient.get(path: path)
+        let response: HttpResponse<CampaignResponse> = try await get(path: path)
         return response.data
     }
 
@@ -251,7 +424,7 @@ public final class ApiClient {
         options.headers = ["x-distinct-id": resolvedId]
         // Server returns { key: string | null } — GET /sdk/flags/evaluate via FlagPublicController
         // Map string variant directly to FlagVariant
-        let response: HttpResponse<[String: String?]> = try await httpClient.get(path: "/sdk/flags/evaluate?keys=\(keysParam)", options: options)
+        let response: HttpResponse<[String: String?]> = try await get(path: "/sdk/flags/evaluate?keys=\(keysParam)", options: options)
         return response.data.mapValues { variantKey in
             FlagVariant(variant: variantKey)
         }
@@ -261,7 +434,7 @@ public final class ApiClient {
         guard let resolvedId = resolveDistinctId(distinctId) else { return FlagVariant(variant: nil) }
         let encoded = resolvedId.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? resolvedId
         let path = "/sdk/flags/\(key)?distinctId=\(encoded)"
-        let response: HttpResponse<FlagVariant> = try await httpClient.get(path: path)
+        let response: HttpResponse<FlagVariant> = try await get(path: path)
         return response.data
     }
 
@@ -275,14 +448,14 @@ public final class ApiClient {
         }
         var path = "/sdk/conditional-flags/\(key)"
         if !queryItems.isEmpty { path += "?" + queryItems.joined(separator: "&") }
-        let response: HttpResponse<ConditionalFlagResult> = try await httpClient.get(path: path)
+        let response: HttpResponse<ConditionalFlagResult> = try await get(path: path)
         return response.data
     }
 
     // MARK: - Emergency Paywall
 
     public func getEmergencyPaywall() async throws -> EmergencyPaywallResponse {
-        let response: HttpResponse<EmergencyPaywallResponse> = try await httpClient.get(path: "/sdk/emergency-paywall")
+        let response: HttpResponse<EmergencyPaywallResponse> = try await get(path: "/sdk/emergency-paywall")
         return response.data
     }
 
@@ -291,16 +464,31 @@ public final class ApiClient {
     public func validatePurchase(_ body: [String: Any]) async throws -> ValidatePurchaseResponse {
         let jsonData = try JSONSerialization.data(withJSONObject: body)
         let options = RequestOptions(method: "POST", body: jsonData)
+        let response = try await httpClient.requestRaw(path: "/sdk/purchases/validate", options: options)
+
+        // The status has to be surfaced as a typed error, not swallowed by a decode failure.
+        // Decoding a 4xx body throws a DecodingError, which carries no status, so the caller
+        // could not tell a permanently rejected receipt from a transient blip and retried a
+        // receipt that will never validate.
+        guard response.ok else {
+            throw PurchaseError(
+                code: PurchaseErrorCode.validationFailed,
+                message: "Server validation failed: HTTP \(response.status)",
+                userCancelled: false,
+                httpStatus: response.status
+            )
+        }
+
         // Server wraps response in V2 envelope: { data: { valid, subscription_id, ... }, meta: {...} }
-        let response: HttpResponse<V2Envelope<ValidatePurchaseResponse>> = try await httpClient.request(path: "/sdk/purchases/validate", options: options)
-        return response.data.data
+        let envelope = try JSONDecoder().decode(V2Envelope<ValidatePurchaseResponse>.self, from: response.data)
+        return envelope.data
     }
 
     public func getSubscriptionStatus(distinctId: String?) async throws -> SubscriptionStatusResponse {
         var path = "/sdk/purchases/status"
         if let distinctId = distinctId { path += "?distinctId=\(distinctId)" }
         // Server wraps response in V2 envelope: { data: { has_active_subscription, ... }, meta: {...} }
-        let response: HttpResponse<V2Envelope<SubscriptionStatusResponse>> = try await httpClient.get(path: path)
+        let response: HttpResponse<V2Envelope<SubscriptionStatusResponse>> = try await get(path: path)
         return response.data.data
     }
 
