@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FBSDKCoreKit)
+import FBSDKCoreKit
+#endif
 
 /// Meta's deferred app link, parsed. On iOS this IS the install referrer: there is no
 /// Play Install Referrer, so the link Meta hands back on first launch is the only
@@ -94,17 +97,32 @@ public final class MetaBridge {
         #endif
     }
 
+    #if canImport(FBSDKCoreKit)
+    /// FBSDK types App Events parameters as `[AppEvents.ParameterName: Any]`,
+    /// while this bridge's public API takes `[String: Any]`. Convert at the
+    /// boundary so callers keep the plain-dictionary signature.
+    private static func fbParameters(
+        _ parameters: [String: Any]?
+    ) -> [FBSDKCoreKit.AppEvents.ParameterName: Any] {
+        var converted: [FBSDKCoreKit.AppEvents.ParameterName: Any] = [:]
+        for (key, value) in parameters ?? [:] {
+            converted[FBSDKCoreKit.AppEvents.ParameterName(key)] = value
+        }
+        return converted
+    }
+    #endif
+
     /// Log event to Facebook. No-op if FBSDK not available.
     public func logEvent(_ name: String, parameters: [String: Any]? = nil) {
         #if canImport(FBSDKCoreKit)
-        FBSDKCoreKit.AppEvents.shared.logEvent(FBSDKCoreKit.AppEvents.Name(name), parameters: parameters ?? [:])
+        FBSDKCoreKit.AppEvents.shared.logEvent(FBSDKCoreKit.AppEvents.Name(name), parameters: Self.fbParameters(parameters))
         #endif
     }
 
     /// Log purchase to Facebook. No-op if FBSDK not available.
     public func logPurchase(amount: Double, currency: String, parameters: [String: Any]? = nil) {
         #if canImport(FBSDKCoreKit)
-        FBSDKCoreKit.AppEvents.shared.logPurchase(amount: amount, currency: currency, parameters: parameters ?? [:])
+        FBSDKCoreKit.AppEvents.shared.logPurchase(amount: amount, currency: currency, parameters: Self.fbParameters(parameters))
         #endif
     }
 
